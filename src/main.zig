@@ -6,6 +6,7 @@ const inference = @import("inference.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const sampler = @import("sampler.zig");
 const validation = @import("validation.zig");
+const lut = @import("lut_mul.zig");
 
 fn parseUsize(arg: []const u8) !usize {
     return std.fmt.parseInt(usize, arg, 10);
@@ -34,8 +35,10 @@ pub fn main() !void {
     // Validasi hot-path inference (default ON)
     var no_validate: bool = false;
 
-    // arg parsing:
-    // - positional non-flag = model path
+    // LUT toggle (default: mengikuti USE_LUT_MUL di tensor.zig)
+    var use_lut: ?bool = null;
+
+    // arg parsing
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -61,6 +64,16 @@ pub fn main() !void {
             continue;
         }
 
+        // === LUT flags ===
+        if (std.mem.eql(u8, a, "--lut")) {
+            use_lut = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-lut")) {
+            use_lut = false;
+            continue;
+        }
+
         if (std.mem.eql(u8, a, "--threads")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -79,11 +92,18 @@ pub fn main() !void {
         }
     }
 
+    // === Apply LUT override ===
+    if (use_lut) |v| {
+        lut.g_lut_enabled = v;
+    }
+
+    const lut_active = tensor.USE_LUT_MUL and lut.g_lut_enabled;
+
     const validator = validation.Validator.initDefault();
     validator.validateModelPath(model_path) catch |err| {
         std.debug.print("Error: {s}\n", .{validation.errorMessage(err)});
         std.debug.print(
-            "Usage: zig-llama <model.gguf> [--quiet] [--profile] [--threads N] [--mt-wo] [--mt-w2] [--no-validate]\n",
+            "Usage: zig-llama <model.gguf> [--quiet] [--profile] [--threads N] [--mt-wo] [--mt-w2] [--no-validate] [--lut] [--no-lut]\n",
             .{},
         );
         return;
@@ -144,6 +164,14 @@ pub fn main() !void {
     std.debug.print("MT WO: {}\n", .{infer_state.mt_wo_enabled});
     std.debug.print("MT W2: {}\n", .{infer_state.mt_w2_enabled});
     std.debug.print("Validation(inference): {}\n", .{infer_state.validation_enabled});
+    std.debug.print("LUT MatMul-Free: {}\n", .{lut_active});
+    if (lut_active) {
+        std.debug.print("LUT Grid: {}x{} = {} KB (i8 x i8 -> i16)\n", .{
+            256,
+            256,
+            (256 * 256 * 2) / 1024,
+        });
+    }
     std.debug.print("============================================================\n\n", .{});
 
     const prompt =
@@ -304,13 +332,15 @@ pub fn main() !void {
         gen_tps,
     });
     std.debug.print("Total: {} ms\n", .{total_duration});
+    std.debug.print("Mode: {s}\n", .{if (lut_active) "LUT MatMul-Free" else "Standard SIMD"});
     std.debug.print("============================================================\n", .{});
 
     if (infer_state.profiling_enabled) {
         infer_state.profile_stats.print();
     }
 
+    // Cleanup thread pool
+    tensor.shutdownKernels();
+
     std.debug.print("\n[SUCCESS] Done.\n", .{});
 }
-
-// check point
