@@ -1,28 +1,16 @@
+// src/model.zig
 const std = @import("std");
 const gguf = @import("gguf.zig");
 
 const Tensor = @import("tensor.zig").Tensor;
 const QuantizedTensor = @import("tensor.zig").QuantizedTensor;
 
-// ============================
-// Alignment for fast SIMD loads
-// ============================
-
-// must be power-of-two
 const ALIGN_BYTES: usize = 64;
-
-// Zig 0.15.x: alignedAlloc expects ?std.mem.Alignment (enum of log2(bytes))
 const ALIGNMENT: ?std.mem.Alignment = blk: {
-    if (!std.math.isPowerOfTwo(ALIGN_BYTES)) {
-        @compileError("ALIGN_BYTES must be power-of-two");
-    }
+    if (!std.math.isPowerOfTwo(ALIGN_BYTES)) @compileError("ALIGN_BYTES must be power-of-two");
     const log2: std.math.Log2Int(usize) = @intCast(@ctz(@as(usize, ALIGN_BYTES)));
     break :blk @as(std.mem.Alignment, @enumFromInt(log2));
 };
-
-// ============================
-// Model config
-// ============================
 
 pub const ModelConfig = struct {
     dim: u32,
@@ -38,9 +26,7 @@ pub const ModelConfig = struct {
 
     pub fn fromGGUF(g: *gguf.GGUFFile) ModelConfig {
         const arch = g.getMetadataString("general.architecture") orelse "llama";
-
         var key_buf: [128]u8 = undefined;
-
         const makeKey = struct {
             fn f(buf: *[128]u8, arch_name: []const u8, suffix: []const u8) []const u8 {
                 return std.fmt.bufPrint(buf, "{s}.{s}", .{ arch_name, suffix }) catch "llama.embedding_length";
@@ -48,47 +34,32 @@ pub const ModelConfig = struct {
         }.f;
 
         const dim = g.getMetadataU32(makeKey(&key_buf, arch, "embedding_length")) orelse 4096;
-        const ffn_dim = g.getMetadataU32(makeKey(&key_buf, arch, "feed_forward_length")) orelse 11008;
-        const n_layers = g.getMetadataU32(makeKey(&key_buf, arch, "block_count")) orelse 32;
-        const n_heads = g.getMetadataU32(makeKey(&key_buf, arch, "attention.head_count")) orelse 32;
-        const n_kv_heads = g.getMetadataU32(makeKey(&key_buf, arch, "attention.head_count_kv")) orelse 32;
-        const ctx_len = g.getMetadataU32(makeKey(&key_buf, arch, "context_length")) orelse 2048;
-        const rope_theta = g.getMetadataF32(makeKey(&key_buf, arch, "rope.freq_base")) orelse 10000.0;
-        const rms_eps = g.getMetadataF32(makeKey(&key_buf, arch, "attention.layer_norm_rms_epsilon")) orelse 1e-6;
-
-        return ModelConfig{
+        return .{
             .dim = dim,
             .hidden_dim = dim,
-            .ffn_hidden_dim = ffn_dim,
-            .n_layers = n_layers,
-            .n_heads = n_heads,
-            .n_kv_heads = n_kv_heads,
+            .ffn_hidden_dim = g.getMetadataU32(makeKey(&key_buf, arch, "feed_forward_length")) orelse 11008,
+            .n_layers = g.getMetadataU32(makeKey(&key_buf, arch, "block_count")) orelse 32,
+            .n_heads = g.getMetadataU32(makeKey(&key_buf, arch, "attention.head_count")) orelse 32,
+            .n_kv_heads = g.getMetadataU32(makeKey(&key_buf, arch, "attention.head_count_kv")) orelse 32,
             .vocab_size = 151936,
-            .max_seq_len = @min(ctx_len, 4096),
-            .rope_theta = rope_theta,
-            .rms_norm_eps = rms_eps,
+            .max_seq_len = @min(g.getMetadataU32(makeKey(&key_buf, arch, "context_length")) orelse 2048, 4096),
+            .rope_theta = g.getMetadataF32(makeKey(&key_buf, arch, "rope.freq_base")) orelse 10000.0,
+            .rms_norm_eps = g.getMetadataF32(makeKey(&key_buf, arch, "attention.layer_norm_rms_epsilon")) orelse 1e-6,
         };
     }
 };
-
-// ============================
-// Layer + model structs
-// ============================
 
 pub const TransformerLayer = struct {
     wq: QuantizedTensor,
     wk: QuantizedTensor,
     wv: QuantizedTensor,
     wo: QuantizedTensor,
-
     bq: ?Tensor,
     bk: ?Tensor,
     bv: ?Tensor,
-
     w1: QuantizedTensor,
     w2: QuantizedTensor,
     w3: QuantizedTensor,
-
     attn_norm: Tensor,
     ffn_norm: Tensor,
 
@@ -97,15 +68,12 @@ pub const TransformerLayer = struct {
         self.wk.deinit();
         self.wv.deinit();
         self.wo.deinit();
-
         if (self.bq) |*bq| bq.deinit();
         if (self.bk) |*bk| bk.deinit();
         if (self.bv) |*bv| bv.deinit();
-
         self.w1.deinit();
         self.w2.deinit();
         self.w3.deinit();
-
         self.attn_norm.deinit();
         self.ffn_norm.deinit();
     }
@@ -124,7 +92,6 @@ pub const LlamaModel = struct {
     pub fn fromGGUF(gguf_file: *gguf.GGUFFile, allocator: std.mem.Allocator) !LlamaModel {
         var config = ModelConfig.fromGGUF(gguf_file);
 
-        // Read file into memory (raw bytes)
         const file = try std.fs.cwd().openFile(gguf_file.file_path, .{});
         defer file.close();
 
@@ -133,92 +100,57 @@ pub const LlamaModel = struct {
         errdefer allocator.free(file_data);
 
         const bytes_read = try file.readAll(file_data);
-        if (bytes_read != file_size) {
-            return error.IncompleteRead;
-        }
+        if (bytes_read != file_size) return error.IncompleteRead;
 
-        std.debug.print("  File loaded: {d:.2} MB\n", .{@as(f64, @floatFromInt(file_size)) / 1024.0 / 1024.0});
+        std.debug.print("  File loaded: {d:.2} MB\n", .{@as(f64, @floatFromInt(file_size)) / 1048576.0});
 
-        // Get vocab size from token embeddings tensor
         if (gguf_file.getTensorByName("token_embd.weight")) |emb_info| {
-            if (emb_info.n_dims >= 2) {
-                config.vocab_size = @intCast(emb_info.dims[1]);
-            }
+            if (emb_info.n_dims >= 2) config.vocab_size = @intCast(emb_info.dims[1]);
         }
 
-        std.debug.print("Loading Q8_0 model: {} layers, dim={}, vocab={}\n", .{
-            config.n_layers,
-            config.dim,
-            config.vocab_size,
-        });
+        std.debug.print("Loading Q8_0 model: {} layers, dim={}, vocab={}\n", .{ config.n_layers, config.dim, config.vocab_size });
 
         const layers = try allocator.alloc(TransformerLayer, config.n_layers);
         errdefer allocator.free(layers);
 
-        for (0..config.n_layers) |layer_idx| {
-            if (layer_idx == 0 or (layer_idx + 1) % 10 == 0) {
-                std.debug.print("  Loading layer {}/{}...\n", .{ layer_idx + 1, config.n_layers });
-            }
+        for (0..config.n_layers) |li| {
+            if (li == 0 or (li + 1) % 10 == 0)
+                std.debug.print("  Loading layer {}/{}...\n", .{ li + 1, config.n_layers });
 
-            var name_buf: [128]u8 = undefined;
+            var nb: [128]u8 = undefined;
 
-            const wq = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_q.weight", layer_idx);
-            const wk = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_k.weight", layer_idx);
-            const wv = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_v.weight", layer_idx);
-            const wo = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_output.weight", layer_idx);
-
-            const bq = loadF32Tensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_q.bias", layer_idx);
-            const bk = loadF32Tensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_k.bias", layer_idx);
-            const bv = loadF32Tensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_v.bias", layer_idx);
-
-            if (layer_idx == 0 and bq != null) {
-                std.debug.print("  Note: Model has attention biases (Qwen2 style)\n", .{});
-            }
-
-            const w1 = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.ffn_gate.weight", layer_idx);
-            const w2 = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.ffn_down.weight", layer_idx);
-            const w3 = try loadQuantizedTensor(gguf_file, file_data, allocator, &name_buf, "blk.{}.ffn_up.weight", layer_idx);
-
-            const attn_norm = try loadF32TensorRequired(gguf_file, file_data, allocator, &name_buf, "blk.{}.attn_norm.weight", layer_idx);
-            const ffn_norm = try loadF32TensorRequired(gguf_file, file_data, allocator, &name_buf, "blk.{}.ffn_norm.weight", layer_idx);
-
-            layers[layer_idx] = TransformerLayer{
-                .wq = wq,
-                .wk = wk,
-                .wv = wv,
-                .wo = wo,
-                .bq = bq,
-                .bk = bk,
-                .bv = bv,
-                .w1 = w1,
-                .w2 = w2,
-                .w3 = w3,
-                .attn_norm = attn_norm,
-                .ffn_norm = ffn_norm,
+            layers[li] = .{
+                .wq = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_q.weight", li),
+                .wk = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_k.weight", li),
+                .wv = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_v.weight", li),
+                .wo = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_output.weight", li),
+                .bq = loadFT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_q.bias", li),
+                .bk = loadFT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_k.bias", li),
+                .bv = loadFT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_v.bias", li),
+                .w1 = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_gate.weight", li),
+                .w2 = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_down.weight", li),
+                .w3 = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_up.weight", li),
+                .attn_norm = try loadFTReq(gguf_file, file_data, allocator, &nb, "blk.{}.attn_norm.weight", li),
+                .ffn_norm = try loadFTReq(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_norm.weight", li),
             };
+
+            if (li == 0 and layers[0].bq != null)
+                std.debug.print("  Note: Model has attention biases (Qwen2 style)\n", .{});
         }
 
         std.debug.print("  Loading token embeddings (Q8_0)...\n", .{});
-        const tok_emb = try loadQuantizedTensorByName(gguf_file, file_data, allocator, "token_embd.weight");
-
-        if (tok_emb.shape.len >= 2) {
-            config.vocab_size = tok_emb.shape[1];
-        }
+        const tok_emb = try loadQTByName(gguf_file, file_data, allocator, "token_embd.weight");
+        if (tok_emb.shape.len >= 2) config.vocab_size = tok_emb.shape[1];
 
         std.debug.print("  Loading output projection...\n", .{});
-        var use_tied_embeddings = false;
-
-        const output = loadQuantizedTensorByName(gguf_file, file_data, allocator, "output.weight") catch |err| blk: {
+        var use_tied = false;
+        const output = loadQTByName(gguf_file, file_data, allocator, "output.weight") catch |err| blk: {
             if (err == error.TensorNotFound) {
-                std.debug.print("  Note: Using tied embeddings (output = token_embd)\n", .{});
-                use_tied_embeddings = true;
-
-                const empty_u8: []u8 = @constCast(@as([]const u8, &[_]u8{}));
-                const empty_u32: []u32 = @constCast(@as([]const u32, &[_]u32{}));
-
+                std.debug.print("  Note: Using tied embeddings\n", .{});
+                use_tied = true;
                 break :blk QuantizedTensor{
-                    .data = empty_u8,
-                    .shape = empty_u32,
+                    .data = @constCast(@as([]const u8, &[_]u8{})),
+                    .shape = @constCast(@as([]const u32, &[_]u32{})),
                     .n_blocks = 0,
                     .block_size = 32,
                     .quant_type = .Q8_0,
@@ -228,184 +160,100 @@ pub const LlamaModel = struct {
             return err;
         };
 
-        const norm = try loadF32TensorByName(gguf_file, file_data, allocator, "output_norm.weight");
+        const norm = try loadFTByName(gguf_file, file_data, allocator, "output_norm.weight");
 
-        // Memory report
-        var quant_bytes: usize = 0;
-        var f32_bytes: usize = 0;
-
-        for (layers) |*layer| {
-            quant_bytes += layer.wq.data.len + layer.wk.data.len + layer.wv.data.len + layer.wo.data.len;
-            quant_bytes += layer.w1.data.len + layer.w2.data.len + layer.w3.data.len;
-
-            f32_bytes += layer.attn_norm.data.len * 4 + layer.ffn_norm.data.len * 4;
-            if (layer.bq) |bq0| f32_bytes += bq0.data.len * 4;
-            if (layer.bk) |bk0| f32_bytes += bk0.data.len * 4;
-            if (layer.bv) |bv0| f32_bytes += bv0.data.len * 4;
+        var qb: usize = 0;
+        var fb: usize = 0;
+        for (layers) |*l| {
+            qb += l.wq.data.len + l.wk.data.len + l.wv.data.len + l.wo.data.len + l.w1.data.len + l.w2.data.len + l.w3.data.len;
+            fb += l.attn_norm.data.len * 4 + l.ffn_norm.data.len * 4;
+            if (l.bq) |b| fb += b.data.len * 4;
+            if (l.bk) |b| fb += b.data.len * 4;
+            if (l.bv) |b| fb += b.data.len * 4;
         }
-
-        quant_bytes += tok_emb.data.len;
-        f32_bytes += norm.data.len * 4;
-        if (!use_tied_embeddings) quant_bytes += output.data.len;
+        qb += tok_emb.data.len;
+        fb += norm.data.len * 4;
+        if (!use_tied) qb += output.data.len;
 
         std.debug.print("\nMemory Usage:\n", .{});
-        std.debug.print("  Quantized weights: {d:.2} MB\n", .{@as(f64, @floatFromInt(quant_bytes)) / 1024.0 / 1024.0});
-        std.debug.print("  F32 tensors:       {d:.2} MB\n", .{@as(f64, @floatFromInt(f32_bytes)) / 1024.0 / 1024.0});
-        std.debug.print("  Total:             {d:.2} MB\n", .{@as(f64, @floatFromInt(quant_bytes + f32_bytes)) / 1024.0 / 1024.0});
+        std.debug.print("  Quantized weights: {d:.2} MB\n", .{@as(f64, @floatFromInt(qb)) / 1048576.0});
+        std.debug.print("  F32 tensors:       {d:.2} MB\n", .{@as(f64, @floatFromInt(fb)) / 1048576.0});
+        std.debug.print("  Total:             {d:.2} MB\n", .{@as(f64, @floatFromInt(qb + fb)) / 1048576.0});
 
-        return LlamaModel{
+        return .{
             .config = config,
             .layers = layers,
             .norm = norm,
             .tok_embeddings = tok_emb,
             .output = output,
-            .use_tied_embeddings = use_tied_embeddings,
+            .use_tied_embeddings = use_tied,
             .allocator = allocator,
             .file_data = file_data,
         };
     }
 
     pub fn deinit(self: *LlamaModel) void {
-        for (self.layers) |*layer| {
-            layer.deinit();
-        }
+        for (self.layers) |*layer| layer.deinit();
         self.allocator.free(self.layers);
-
         self.norm.deinit();
         self.tok_embeddings.deinit();
-        if (!self.use_tied_embeddings) {
-            self.output.deinit();
-        }
-
+        if (!self.use_tied_embeddings) self.output.deinit();
         self.allocator.free(self.file_data);
     }
 };
 
 // =============================================================================
-// Tensor Loading Helpers
+// Tensor Loading
 // =============================================================================
 
-fn loadQuantizedTensor(
-    gguf_file: *gguf.GGUFFile,
-    file_data: []const u8,
-    allocator: std.mem.Allocator,
-    name_buf: *[128]u8,
-    comptime fmt: []const u8,
-    layer_idx: usize,
-) !QuantizedTensor {
-    const name = std.fmt.bufPrint(name_buf, fmt, .{layer_idx}) catch unreachable;
-    return loadQuantizedTensorByName(gguf_file, file_data, allocator, name);
+fn loadQT(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) !QuantizedTensor {
+    const name = std.fmt.bufPrint(nb, fmt, .{li}) catch unreachable;
+    return loadQTByName(gf, fd, a, name);
 }
 
-fn loadQuantizedTensorByName(
-    gguf_file: *gguf.GGUFFile,
-    file_data: []const u8,
-    allocator: std.mem.Allocator,
-    name: []const u8,
-) !QuantizedTensor {
-    const tensor_info = gguf_file.getTensorByName(name) orelse {
-        return error.TensorNotFound;
-    };
-
-    const data_offset = gguf_file.tensor_data_offset + tensor_info.offset;
-
-    const quant_type: QuantizedTensor.QuantType = switch (tensor_info.dtype) {
+fn loadQTByName(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, name: []const u8) !QuantizedTensor {
+    const ti = gf.getTensorByName(name) orelse return error.TensorNotFound;
+    const off = gf.tensor_data_offset + ti.offset;
+    const qt: QuantizedTensor.QuantType = switch (ti.dtype) {
         .Q4_0 => .Q4_0,
         .Q4_1 => .Q4_1,
         .Q8_0 => .Q8_0,
         .F32 => return error.F32NotQuantized,
-        else => {
-            std.debug.print("Unsupported quant type {s} for {s}\n", .{ @tagName(tensor_info.dtype), name });
-            return error.UnsupportedQuantType;
-        },
+        else => return error.UnsupportedQuantType,
     };
-
-    const block_size: u32 = 32;
-
-    const bytes_per_block: u32 = switch (quant_type) {
+    const bpb: u32 = switch (qt) {
         .Q4_0 => 18,
         .Q4_1 => 20,
         .Q8_0 => 34,
     };
-
-    var total_elements: u64 = 1;
-    for (0..tensor_info.n_dims) |i| {
-        total_elements *= tensor_info.dims[i];
-    }
-
-    const n_blocks = @as(u32, @intCast(total_elements / block_size));
-    const data_size = @as(usize, n_blocks) * bytes_per_block;
-
-    // NOTE: Zig 0.15 alignedAlloc expects ?std.mem.Alignment
-    const quant_data = try allocator.alignedAlloc(u8, ALIGNMENT, data_size);
-    errdefer allocator.free(quant_data);
-
-    @memcpy(quant_data, file_data[data_offset..][0..data_size]);
-
-    const shape = try allocator.alloc(u32, tensor_info.n_dims);
-    for (0..tensor_info.n_dims) |i| {
-        shape[i] = @intCast(tensor_info.dims[i]);
-    }
-
-    return QuantizedTensor{
-        .data = quant_data,
-        .shape = shape,
-        .n_blocks = n_blocks,
-        .block_size = block_size,
-        .quant_type = quant_type,
-        .allocator = allocator,
-    };
+    var total: u64 = 1;
+    for (0..ti.n_dims) |j| total *= ti.dims[j];
+    const nb2 = @as(u32, @intCast(total / 32));
+    const ds = @as(usize, nb2) * bpb;
+    const d = try a.alignedAlloc(u8, ALIGNMENT, ds);
+    errdefer a.free(d);
+    @memcpy(d, fd[off..][0..ds]);
+    const shape = try a.alloc(u32, ti.n_dims);
+    for (0..ti.n_dims) |j| shape[j] = @intCast(ti.dims[j]);
+    return .{ .data = d, .shape = shape, .n_blocks = nb2, .block_size = 32, .quant_type = qt, .allocator = a };
 }
 
-fn loadF32Tensor(
-    gguf_file: *gguf.GGUFFile,
-    file_data: []const u8,
-    allocator: std.mem.Allocator,
-    name_buf: *[128]u8,
-    comptime fmt: []const u8,
-    layer_idx: usize,
-) ?Tensor {
-    const name = std.fmt.bufPrint(name_buf, fmt, .{layer_idx}) catch unreachable;
-    return loadF32TensorByName(gguf_file, file_data, allocator, name) catch null;
+fn loadFT(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) ?Tensor {
+    const name = std.fmt.bufPrint(nb, fmt, .{li}) catch unreachable;
+    return loadFTByName(gf, fd, a, name) catch null;
 }
 
-fn loadF32TensorRequired(
-    gguf_file: *gguf.GGUFFile,
-    file_data: []const u8,
-    allocator: std.mem.Allocator,
-    name_buf: *[128]u8,
-    comptime fmt: []const u8,
-    layer_idx: usize,
-) !Tensor {
-    const name = std.fmt.bufPrint(name_buf, fmt, .{layer_idx}) catch unreachable;
-    return loadF32TensorByName(gguf_file, file_data, allocator, name);
+fn loadFTReq(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) !Tensor {
+    const name = std.fmt.bufPrint(nb, fmt, .{li}) catch unreachable;
+    return loadFTByName(gf, fd, a, name);
 }
 
-fn loadF32TensorByName(
-    gguf_file: *gguf.GGUFFile,
-    file_data: []const u8,
-    allocator: std.mem.Allocator,
-    name: []const u8,
-) !Tensor {
-    const tensor_info = gguf_file.getTensorByName(name) orelse return error.TensorNotFound;
-
-    const data_offset = gguf_file.tensor_data_offset + tensor_info.offset;
-
-    var total_elements: usize = 1;
-    for (0..tensor_info.n_dims) |i| {
-        total_elements *= @intCast(tensor_info.dims[i]);
-    }
-
-    // aligned allocation for faster SIMD
-    const data = try allocator.alignedAlloc(f32, ALIGNMENT, total_elements);
-    errdefer allocator.free(data);
-
-    const src = file_data[data_offset..][0 .. total_elements * 4];
-    @memcpy(std.mem.sliceAsBytes(data), src);
-
-    return Tensor{
-        .data = data,
-        .shape = &[_]u32{@intCast(total_elements)},
-        .allocator = allocator,
-    };
+fn loadFTByName(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, name: []const u8) !Tensor {
+    const ti = gf.getTensorByName(name) orelse return error.TensorNotFound;
+    const off = gf.tensor_data_offset + ti.offset;
+    var total: usize = 1;
+    for (0..ti.n_dims) |j| total *= @intCast(ti.dims[j]);
+    const data = try a.alignedAlloc(f32, ALIGNMENT, total);
+    @memcpy(std.mem.sliceAsBytes(data), fd[off..][0 .. total * 4]);
+    return .{ .data = data, .shape = &[_]u32{@intCast(total)}, .allocator = a };
 }

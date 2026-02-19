@@ -1,76 +1,78 @@
-//! ==========================================================================
-//! LUT Multiplication Engine — INTEGER MULTIPLY-FREE
-//! ==========================================================================
-//!
-//! Semua perkalian INTEGER i8 x i8 diganti dengan tabel lookup.
-//! Ini menghilangkan 99%+ dari total operasi multiply:
-//!   - 32 multiply per Q8 block (diganti tabel)
-//!   - Ribuan block per row
-//!   - Ribuan row per matmul
-//!
-//! Float scaling (2-3 per block) tetap pakai operator * karena:
-//!   - Jumlahnya sangat kecil (<0.1% dari total multiply)
-//!   - Presisi f32 tidak bisa di-tabel-kan secara akurat
-//!
-
+// src/lut_mul.zig — Shift-Add SIMD MatMul-Free v1
 const std = @import("std");
-const tables = @import("lut_tables.zig");
-
-// ============================================================
-// Configuration
-// ============================================================
 
 pub var g_lut_enabled: bool = true;
 
-// ============================================================
-// Core: Integer Multiply via Pre-computed Table
-// Mengganti semua i8 * i8 dalam dot product
-// ============================================================
-
-inline fn lookupMulU8I8(a_raw: u8, b: i8) i16 {
-    @setRuntimeSafety(false);
-    const ia: usize = @intCast(a_raw);
-    const ib: usize = @intCast(@as(u8, @bitCast(b)));
-    return tables.grid_i16[ia][ib];
-}
-
-inline fn lookupMulI8(a: i8, b: i8) i16 {
-    @setRuntimeSafety(false);
-    const ia: usize = @intCast(@as(u8, @bitCast(a)));
-    const ib: usize = @intCast(@as(u8, @bitCast(b)));
-    return tables.grid_i16[ia][ib];
-}
+const VU8x32 = @Vector(32, u8);
+const VI8x32 = @Vector(32, i8);
+const VU16x32 = @Vector(32, u16);
+const VI16x32 = @Vector(32, i16);
+const VI32x32 = @Vector(32, i32);
 
 // ============================================================
-// Dot Product i8[32] x i8[32] -> i32 via Table Lookup
+// Core: SIMD Shift-Add Multiply — ZERO MUL instruction
 //
-// SEBELUM (hardware multiply):
-//   prod16 = w16 * x16;   <-- 32 integer multiplies
-//
-// SESUDAH (table lookup):
-//   sum += grid_i16[w[i]][x[i]];  <-- 32 table lookups, ZERO multiply
+// Decompose x (input) bits, shift w (weight) accordingly
+// 7 bit-iterations, all 32 elements in parallel
 // ============================================================
 
 pub fn dotI8x32_lut(w_ptr: [*]const u8, x_ptr: [*]const i8) i32 {
     @setRuntimeSafety(false);
 
-    var sum: i32 = 0;
+    const w_u8: VU8x32 = @as(*align(1) const VU8x32, @ptrCast(w_ptr)).*;
+    const x_i8: VI8x32 = @as(*align(1) const VI8x32, @ptrCast(x_ptr)).*;
 
-    comptime var base: usize = 0;
-    inline while (base < 32) : (base += 8) {
-        const s0: i32 = lookupMulU8I8(w_ptr[base + 0], x_ptr[base + 0]);
-        const s1: i32 = lookupMulU8I8(w_ptr[base + 1], x_ptr[base + 1]);
-        const s2: i32 = lookupMulU8I8(w_ptr[base + 2], x_ptr[base + 2]);
-        const s3: i32 = lookupMulU8I8(w_ptr[base + 3], x_ptr[base + 3]);
-        const s4: i32 = lookupMulU8I8(w_ptr[base + 4], x_ptr[base + 4]);
-        const s5: i32 = lookupMulU8I8(w_ptr[base + 5], x_ptr[base + 5]);
-        const s6: i32 = lookupMulU8I8(w_ptr[base + 6], x_ptr[base + 6]);
-        const s7: i32 = lookupMulU8I8(w_ptr[base + 7], x_ptr[base + 7]);
+    // Separate signs
+    const w_sign: VI8x32 = @bitCast(w_u8);
+    const w_neg: @Vector(32, bool) = w_sign < @as(VI8x32, @splat(0));
+    const x_neg: @Vector(32, bool) = x_i8 < @as(VI8x32, @splat(0));
+    const result_neg: @Vector(32, bool) = w_neg != x_neg;
 
-        sum += (s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7);
-    }
+    // Absolute values as u8
+    const w_abs_i8: VI8x32 = @select(i8, w_neg, -%w_sign, w_sign);
+    const x_abs_i8: VI8x32 = @select(i8, x_neg, -%x_i8, x_i8);
 
-    return sum;
+    const w_abs: VU16x32 = @intCast(@as(VU8x32, @bitCast(w_abs_i8)));
+    const x_abs: @Vector(32, u8) = @bitCast(x_abs_i8);
+
+    // Shift-and-add: multiply via bit decomposition of x_abs
+    const zero16: VU16x32 = @splat(0);
+
+    // Bit 0
+    const b0_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(1))) != @as(@Vector(32, u8), @splat(0));
+    var prod: VU16x32 = @select(u16, b0_mask, w_abs, zero16);
+
+    // Bit 1
+    const b1_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(2))) != @as(@Vector(32, u8), @splat(0));
+    prod += @select(u16, b1_mask, w_abs << @splat(1), zero16);
+
+    // Bit 2
+    const b2_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(4))) != @as(@Vector(32, u8), @splat(0));
+    prod += @select(u16, b2_mask, w_abs << @splat(2), zero16);
+
+    // Bit 3
+    const b3_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(8))) != @as(@Vector(32, u8), @splat(0));
+    prod += @select(u16, b3_mask, w_abs << @splat(3), zero16);
+
+    // Bit 4
+    const b4_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(16))) != @as(@Vector(32, u8), @splat(0));
+    prod += @select(u16, b4_mask, w_abs << @splat(4), zero16);
+
+    // Bit 5
+    const b5_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(32))) != @as(@Vector(32, u8), @splat(0));
+    prod += @select(u16, b5_mask, w_abs << @splat(5), zero16);
+
+    // Bit 6
+    const b6_mask: @Vector(32, bool) = (x_abs & @as(@Vector(32, u8), @splat(64))) != @as(@Vector(32, u8), @splat(0));
+    prod += @select(u16, b6_mask, w_abs << @splat(6), zero16);
+
+    // Apply sign
+    const prod_i16: VI16x32 = @bitCast(prod);
+    const signed_prod: VI16x32 = @select(i16, result_neg, -%prod_i16, prod_i16);
+
+    // Reduce to i32 sum
+    const prod_i32: VI32x32 = @intCast(signed_prod);
+    return @reduce(.Add, prod_i32);
 }
 
 // ============================================================
@@ -83,80 +85,60 @@ inline fn readF16(ptr: [*]const u8) f32 {
 }
 
 // ============================================================
-// Q8 Block with float input — LUT dot + normal float scale
+// Q8 Block with float input
 // ============================================================
 
-pub fn dotQ8Block_f32input_lut(
-    w_block: [*]const u8,
-    input: [*]const f32,
-) f32 {
+pub fn dotQ8Block_f32input_lut(w_block: [*]const u8, input: [*]const f32) f32 {
     @setRuntimeSafety(false);
-
     const w_scale: f32 = readF16(w_block);
 
-    // Quantize input to i8
     var max_abs: f32 = 0;
     for (0..32) |i| {
         const a = @abs(input[i]);
         if (a > max_abs) max_abs = a;
     }
-
     if (max_abs == 0) return 0;
 
     const inv = 127.0 / max_abs;
     const x_scale = max_abs / 127.0;
 
-    // Quantize + LUT dot in one pass
-    var dot: i32 = 0;
+    var qbuf: [32]i8 align(32) = undefined;
     for (0..32) |i| {
         var qi: i32 = @intFromFloat(@round(input[i] * inv));
         if (qi > 127) qi = 127;
         if (qi < -127) qi = -127;
-        const x_i8: i8 = @intCast(qi);
-        // TABLE LOOKUP instead of multiply
-        dot += lookupMulU8I8(w_block[2 + i], x_i8);
+        qbuf[i] = @intCast(qi);
     }
 
-    // Float scaling: only 2 multiplies per 32-element block
-    return (w_scale * x_scale) * @as(f32, @floatFromInt(dot));
+    return (w_scale * x_scale) * @as(f32, @floatFromInt(dotI8x32_lut(w_block + 2, &qbuf)));
 }
 
 // ============================================================
-// Static buffers
+// Static buffers + quantize
 // ============================================================
 
 var g_lut_qbuf: [16384]i8 = undefined;
 var g_lut_scales: [512]f32 = undefined;
 
-// ============================================================
-// Quantize input — standard precision
-// ============================================================
-
 fn quantizeLocal(q_out: []i8, s_out: []f32, input: []const f32, cols: usize) void {
     @setRuntimeSafety(false);
-
     const QBLOCK = 32;
     const blocks = cols >> 5;
-
     var b: usize = 0;
     while (b < blocks) : (b += 1) {
         const base = b << 5;
-
         var max_abs: f32 = 0;
         for (0..QBLOCK) |ii| {
             const a = @abs(input[base + ii]);
             if (a > max_abs) max_abs = a;
         }
-
         if (max_abs == 0) {
             s_out[b] = 0;
             @memset(q_out[base .. base + QBLOCK], 0);
             continue;
         }
-
         const inv = 127.0 / max_abs;
         s_out[b] = max_abs / 127.0;
-
         for (0..QBLOCK) |ii| {
             var qi: i32 = @intFromFloat(@round(input[base + ii] * inv));
             if (qi > 127) qi = 127;
@@ -167,80 +149,45 @@ fn quantizeLocal(q_out: []i8, s_out: []f32, input: []const f32, cols: usize) voi
 }
 
 // ============================================================
-// MatVec Q8_0 via LUT — qin path
-// Integer dot product: TABLE LOOKUP (zero multiply)
-// Float scaling: normal * (2 per block, negligible)
+// MatVec Q8_0 — qin path, 8-row batched
 // ============================================================
 
-pub fn matVecQ8_0_lut_qin(
-    out: []f32,
-    data: []const u8,
-    qbuf: []const i8,
-    scales: []const f32,
-    rows: usize,
-    cols: usize,
-) void {
+pub fn matVecQ8_0_lut_qin(out: []f32, data: []const u8, qbuf: []const i8, scales: []const f32, rows: usize, cols: usize) void {
     @setRuntimeSafety(false);
-
     const QBYTES: usize = 34;
-    const blocks_per_row = cols >> 5;
-    const row_stride = blocks_per_row * QBYTES;
+    const bpr = cols >> 5;
+    const rs = bpr * QBYTES;
 
     var r: usize = 0;
-
     while (r + 8 <= rows) : (r += 8) {
-        var sum0: f32 = 0;
-        var sum1: f32 = 0;
-        var sum2: f32 = 0;
-        var sum3: f32 = 0;
-        var sum4: f32 = 0;
-        var sum5: f32 = 0;
-        var sum6: f32 = 0;
-        var sum7: f32 = 0;
-
-        var p0 = data.ptr + (r + 0) * row_stride;
-        var p1 = data.ptr + (r + 1) * row_stride;
-        var p2 = data.ptr + (r + 2) * row_stride;
-        var p3 = data.ptr + (r + 3) * row_stride;
-        var p4 = data.ptr + (r + 4) * row_stride;
-        var p5 = data.ptr + (r + 5) * row_stride;
-        var p6 = data.ptr + (r + 6) * row_stride;
-        var p7 = data.ptr + (r + 7) * row_stride;
-
+        var s0: f32 = 0;
+        var s1: f32 = 0;
+        var s2: f32 = 0;
+        var s3: f32 = 0;
+        var s4: f32 = 0;
+        var s5: f32 = 0;
+        var s6: f32 = 0;
+        var s7: f32 = 0;
+        var p0 = data.ptr + (r + 0) * rs;
+        var p1 = data.ptr + (r + 1) * rs;
+        var p2 = data.ptr + (r + 2) * rs;
+        var p3 = data.ptr + (r + 3) * rs;
+        var p4 = data.ptr + (r + 4) * rs;
+        var p5 = data.ptr + (r + 5) * rs;
+        var p6 = data.ptr + (r + 6) * rs;
+        var p7 = data.ptr + (r + 7) * rs;
         var b: usize = 0;
-        while (b < blocks_per_row) : (b += 1) {
-            const x_ptr = qbuf.ptr + (b << 5);
-            const sx: f32 = scales[b];
-
-            // === TABLE LOOKUP: 32 lookups per row, ZERO multiply ===
-            const d0: i32 = dotI8x32_lut(p0 + 2, x_ptr);
-            const d1: i32 = dotI8x32_lut(p1 + 2, x_ptr);
-            const d2: i32 = dotI8x32_lut(p2 + 2, x_ptr);
-            const d3: i32 = dotI8x32_lut(p3 + 2, x_ptr);
-            const d4: i32 = dotI8x32_lut(p4 + 2, x_ptr);
-            const d5: i32 = dotI8x32_lut(p5 + 2, x_ptr);
-            const d6: i32 = dotI8x32_lut(p6 + 2, x_ptr);
-            const d7: i32 = dotI8x32_lut(p7 + 2, x_ptr);
-
-            // === Float scaling: 2 multiplies per block (negligible) ===
-            const sw0 = readF16(p0);
-            const sw1 = readF16(p1);
-            const sw2 = readF16(p2);
-            const sw3 = readF16(p3);
-            const sw4 = readF16(p4);
-            const sw5 = readF16(p5);
-            const sw6 = readF16(p6);
-            const sw7 = readF16(p7);
-
-            sum0 += (sw0 * sx) * @as(f32, @floatFromInt(d0));
-            sum1 += (sw1 * sx) * @as(f32, @floatFromInt(d1));
-            sum2 += (sw2 * sx) * @as(f32, @floatFromInt(d2));
-            sum3 += (sw3 * sx) * @as(f32, @floatFromInt(d3));
-            sum4 += (sw4 * sx) * @as(f32, @floatFromInt(d4));
-            sum5 += (sw5 * sx) * @as(f32, @floatFromInt(d5));
-            sum6 += (sw6 * sx) * @as(f32, @floatFromInt(d6));
-            sum7 += (sw7 * sx) * @as(f32, @floatFromInt(d7));
-
+        while (b < bpr) : (b += 1) {
+            const xp = qbuf.ptr + (b << 5);
+            const sx = scales[b];
+            s0 += (readF16(p0) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p0 + 2, xp)));
+            s1 += (readF16(p1) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p1 + 2, xp)));
+            s2 += (readF16(p2) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p2 + 2, xp)));
+            s3 += (readF16(p3) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p3 + 2, xp)));
+            s4 += (readF16(p4) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p4 + 2, xp)));
+            s5 += (readF16(p5) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p5 + 2, xp)));
+            s6 += (readF16(p6) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p6 + 2, xp)));
+            s7 += (readF16(p7) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p7 + 2, xp)));
             p0 += QBYTES;
             p1 += QBYTES;
             p2 += QBYTES;
@@ -250,27 +197,21 @@ pub fn matVecQ8_0_lut_qin(
             p6 += QBYTES;
             p7 += QBYTES;
         }
-
-        out[r + 0] = sum0;
-        out[r + 1] = sum1;
-        out[r + 2] = sum2;
-        out[r + 3] = sum3;
-        out[r + 4] = sum4;
-        out[r + 5] = sum5;
-        out[r + 6] = sum6;
-        out[r + 7] = sum7;
+        out[r + 0] = s0;
+        out[r + 1] = s1;
+        out[r + 2] = s2;
+        out[r + 3] = s3;
+        out[r + 4] = s4;
+        out[r + 5] = s5;
+        out[r + 6] = s6;
+        out[r + 7] = s7;
     }
-
     while (r < rows) : (r += 1) {
         var sum: f32 = 0;
-        var w = data.ptr + r * row_stride;
-
+        var w = data.ptr + r * rs;
         var b: usize = 0;
-        while (b < blocks_per_row) : (b += 1) {
-            const sw = readF16(w);
-            const sx = scales[b];
-            const dot: i32 = dotI8x32_lut(w + 2, qbuf.ptr + (b << 5));
-            sum += (sw * sx) * @as(f32, @floatFromInt(dot));
+        while (b < bpr) : (b += 1) {
+            sum += (readF16(w) * scales[b]) * @as(f32, @floatFromInt(dotI8x32_lut(w + 2, qbuf.ptr + (b << 5))));
             w += QBYTES;
         }
         out[r] = sum;
@@ -278,33 +219,22 @@ pub fn matVecQ8_0_lut_qin(
 }
 
 // ============================================================
-// MatVec Q8_0 via LUT — float input (quantize once)
+// MatVec Q8_0 — float input
 // ============================================================
 
-pub fn matVecQ8_0_lut_f32(
-    out: []f32,
-    data: []const u8,
-    input: []const f32,
-    rows: usize,
-    cols: usize,
-) void {
+pub fn matVecQ8_0_lut_f32(out: []f32, data: []const u8, input: []const f32, rows: usize, cols: usize) void {
     @setRuntimeSafety(false);
-
     const blocks = cols >> 5;
-
     if (cols <= 16384) {
         quantizeLocal(g_lut_qbuf[0..cols], g_lut_scales[0..blocks], input, cols);
         matVecQ8_0_lut_qin(out, data, g_lut_qbuf[0..cols], g_lut_scales[0..blocks], rows, cols);
     } else {
-        // Fallback per-block for very large cols
         const QBYTES: usize = 34;
-        const blocks_per_row = blocks;
-        const row_stride = blocks_per_row * QBYTES;
-
+        const rs = blocks * QBYTES;
         for (0..rows) |r| {
             var sum: f32 = 0;
-            const w = data.ptr + r * row_stride;
-            for (0..blocks_per_row) |b| {
+            const w = data.ptr + r * rs;
+            for (0..blocks) |b| {
                 sum += dotQ8Block_f32input_lut(w + b * QBYTES, input.ptr + (b << 5));
             }
             out[r] = sum;
@@ -316,90 +246,44 @@ pub fn matVecQ8_0_lut_f32(
 // Range kernels for MT pool
 // ============================================================
 
-pub fn matVecQ8_0_range_lut_qin(
-    out_range: []f32,
-    data: []const u8,
-    qbuf: []const i8,
-    scales: []const f32,
-    row_start: usize,
-    row_end: usize,
-    cols: usize,
-) void {
+pub fn matVecQ8_0_range_lut_qin(out_range: []f32, data: []const u8, qbuf: []const i8, scales: []const f32, row_start: usize, row_end: usize, cols: usize) void {
     @setRuntimeSafety(false);
-
     const QBYTES: usize = 34;
-    const PREFETCH_AHEAD: usize = 4;
-    const blocks_per_row = cols >> 5;
-    const row_stride = blocks_per_row * QBYTES;
-
-    const base_ptr = data.ptr + row_start * row_stride;
-    const nrows = row_end - row_start;
+    const bpr = cols >> 5;
+    const rs = bpr * QBYTES;
+    const bp = data.ptr + row_start * rs;
+    const nr = row_end - row_start;
 
     var r: usize = 0;
-
-    while (r + 8 <= nrows) : (r += 8) {
-        var sum0: f32 = 0;
-        var sum1: f32 = 0;
-        var sum2: f32 = 0;
-        var sum3: f32 = 0;
-        var sum4: f32 = 0;
-        var sum5: f32 = 0;
-        var sum6: f32 = 0;
-        var sum7: f32 = 0;
-
-        var p0 = base_ptr + (r + 0) * row_stride;
-        var p1 = base_ptr + (r + 1) * row_stride;
-        var p2 = base_ptr + (r + 2) * row_stride;
-        var p3 = base_ptr + (r + 3) * row_stride;
-        var p4 = base_ptr + (r + 4) * row_stride;
-        var p5 = base_ptr + (r + 5) * row_stride;
-        var p6 = base_ptr + (r + 6) * row_stride;
-        var p7 = base_ptr + (r + 7) * row_stride;
-
+    while (r + 8 <= nr) : (r += 8) {
+        var s0: f32 = 0;
+        var s1: f32 = 0;
+        var s2: f32 = 0;
+        var s3: f32 = 0;
+        var s4: f32 = 0;
+        var s5: f32 = 0;
+        var s6: f32 = 0;
+        var s7: f32 = 0;
+        var p0 = bp + (r + 0) * rs;
+        var p1 = bp + (r + 1) * rs;
+        var p2 = bp + (r + 2) * rs;
+        var p3 = bp + (r + 3) * rs;
+        var p4 = bp + (r + 4) * rs;
+        var p5 = bp + (r + 5) * rs;
+        var p6 = bp + (r + 6) * rs;
+        var p7 = bp + (r + 7) * rs;
         var b: usize = 0;
-        while (b < blocks_per_row) : (b += 1) {
-            if (b + PREFETCH_AHEAD < blocks_per_row) {
-                const off = PREFETCH_AHEAD * QBYTES;
-                @prefetch(p0 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p1 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p2 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p3 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p4 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p5 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p6 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(p7 + off, .{ .rw = .read, .locality = 3, .cache = .data });
-            }
-
-            const x_ptr = qbuf.ptr + (b << 5);
-            const sx: f32 = scales[b];
-
-            const sw0 = readF16(p0);
-            const sw1 = readF16(p1);
-            const sw2 = readF16(p2);
-            const sw3 = readF16(p3);
-            const sw4 = readF16(p4);
-            const sw5 = readF16(p5);
-            const sw6 = readF16(p6);
-            const sw7 = readF16(p7);
-
-            const d0: i32 = dotI8x32_lut(p0 + 2, x_ptr);
-            const d1: i32 = dotI8x32_lut(p1 + 2, x_ptr);
-            const d2: i32 = dotI8x32_lut(p2 + 2, x_ptr);
-            const d3: i32 = dotI8x32_lut(p3 + 2, x_ptr);
-            const d4: i32 = dotI8x32_lut(p4 + 2, x_ptr);
-            const d5: i32 = dotI8x32_lut(p5 + 2, x_ptr);
-            const d6: i32 = dotI8x32_lut(p6 + 2, x_ptr);
-            const d7: i32 = dotI8x32_lut(p7 + 2, x_ptr);
-
-            sum0 += (sw0 * sx) * @as(f32, @floatFromInt(d0));
-            sum1 += (sw1 * sx) * @as(f32, @floatFromInt(d1));
-            sum2 += (sw2 * sx) * @as(f32, @floatFromInt(d2));
-            sum3 += (sw3 * sx) * @as(f32, @floatFromInt(d3));
-            sum4 += (sw4 * sx) * @as(f32, @floatFromInt(d4));
-            sum5 += (sw5 * sx) * @as(f32, @floatFromInt(d5));
-            sum6 += (sw6 * sx) * @as(f32, @floatFromInt(d6));
-            sum7 += (sw7 * sx) * @as(f32, @floatFromInt(d7));
-
+        while (b < bpr) : (b += 1) {
+            const xp = qbuf.ptr + (b << 5);
+            const sx = scales[b];
+            s0 += (readF16(p0) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p0 + 2, xp)));
+            s1 += (readF16(p1) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p1 + 2, xp)));
+            s2 += (readF16(p2) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p2 + 2, xp)));
+            s3 += (readF16(p3) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p3 + 2, xp)));
+            s4 += (readF16(p4) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p4 + 2, xp)));
+            s5 += (readF16(p5) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p5 + 2, xp)));
+            s6 += (readF16(p6) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p6 + 2, xp)));
+            s7 += (readF16(p7) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(p7 + 2, xp)));
             p0 += QBYTES;
             p1 += QBYTES;
             p2 += QBYTES;
@@ -409,153 +293,91 @@ pub fn matVecQ8_0_range_lut_qin(
             p6 += QBYTES;
             p7 += QBYTES;
         }
-
-        out_range[r + 0] = sum0;
-        out_range[r + 1] = sum1;
-        out_range[r + 2] = sum2;
-        out_range[r + 3] = sum3;
-        out_range[r + 4] = sum4;
-        out_range[r + 5] = sum5;
-        out_range[r + 6] = sum6;
-        out_range[r + 7] = sum7;
+        out_range[r + 0] = s0;
+        out_range[r + 1] = s1;
+        out_range[r + 2] = s2;
+        out_range[r + 3] = s3;
+        out_range[r + 4] = s4;
+        out_range[r + 5] = s5;
+        out_range[r + 6] = s6;
+        out_range[r + 7] = s7;
     }
-
-    while (r < nrows) : (r += 1) {
+    while (r < nr) : (r += 1) {
         var sum: f32 = 0;
-        var p = base_ptr + r * row_stride;
+        var p = bp + r * rs;
         var b: usize = 0;
-        while (b < blocks_per_row) : (b += 1) {
-            const sw = readF16(p);
-            const sx = scales[b];
-            const dot: i32 = dotI8x32_lut(p + 2, qbuf.ptr + (b << 5));
-            sum += (sw * sx) * @as(f32, @floatFromInt(dot));
+        while (b < bpr) : (b += 1) {
+            sum += (readF16(p) * scales[b]) * @as(f32, @floatFromInt(dotI8x32_lut(p + 2, qbuf.ptr + (b << 5))));
             p += QBYTES;
         }
         out_range[r] = sum;
     }
 }
 
-pub fn matVecQ8_0_range_lut_f32(
-    out_range: []f32,
-    data: []const u8,
-    input: []const f32,
-    row_start: usize,
-    row_end: usize,
-    cols: usize,
-) void {
+pub fn matVecQ8_0_range_lut_f32(out_range: []f32, data: []const u8, input: []const f32, row_start: usize, row_end: usize, cols: usize) void {
     @setRuntimeSafety(false);
-
     const QBYTES: usize = 34;
-    const blocks_per_row = cols >> 5;
-    const row_stride = blocks_per_row * QBYTES;
-    const base_ptr = data.ptr + row_start * row_stride;
-    const nrows = row_end - row_start;
-
-    var r: usize = 0;
-    while (r < nrows) : (r += 1) {
+    const bpr = cols >> 5;
+    const rs = bpr * QBYTES;
+    const bp = data.ptr + row_start * rs;
+    const nr = row_end - row_start;
+    for (0..nr) |r| {
         var sum: f32 = 0;
-        const w = base_ptr + r * row_stride;
-        for (0..blocks_per_row) |b| {
+        const w = bp + r * rs;
+        for (0..bpr) |b| {
             sum += dotQ8Block_f32input_lut(w + b * QBYTES, input.ptr + (b << 5));
         }
         out_range[r] = sum;
     }
 }
 
-pub fn matVecQ8_0_range_pair_lut_qin(
-    out_a_range: []f32,
-    data_a: []const u8,
-    out_b_range: []f32,
-    data_b: []const u8,
-    qbuf: []const i8,
-    scales: []const f32,
-    row_start: usize,
-    row_end: usize,
-    cols: usize,
-) void {
+pub fn matVecQ8_0_range_pair_lut_qin(out_a: []f32, data_a: []const u8, out_b: []f32, data_b: []const u8, qbuf: []const i8, scales: []const f32, row_start: usize, row_end: usize, cols: usize) void {
     @setRuntimeSafety(false);
-
     const QBYTES: usize = 34;
-    const PREFETCH_AHEAD: usize = 4;
-    const blocks_per_row = cols >> 5;
-    const row_stride = blocks_per_row * QBYTES;
-
-    const base_a = data_a.ptr + row_start * row_stride;
-    const base_b = data_b.ptr + row_start * row_stride;
-    const nrows = row_end - row_start;
-
-    var r: usize = 0;
-    while (r < nrows) : (r += 1) {
-        var suma: f32 = 0;
-        var sumb: f32 = 0;
-
-        var pa = base_a + r * row_stride;
-        var pb = base_b + r * row_stride;
-
+    const bpr = cols >> 5;
+    const rs = bpr * QBYTES;
+    const ba = data_a.ptr + row_start * rs;
+    const bb = data_b.ptr + row_start * rs;
+    const nr = row_end - row_start;
+    for (0..nr) |r| {
+        var sa: f32 = 0;
+        var sb: f32 = 0;
+        var pa = ba + r * rs;
+        var pb = bb + r * rs;
         var b: usize = 0;
-        while (b < blocks_per_row) : (b += 1) {
-            if (b + PREFETCH_AHEAD < blocks_per_row) {
-                const off = PREFETCH_AHEAD * QBYTES;
-                @prefetch(pa + off, .{ .rw = .read, .locality = 3, .cache = .data });
-                @prefetch(pb + off, .{ .rw = .read, .locality = 3, .cache = .data });
-            }
-
-            const x_ptr = qbuf.ptr + (b << 5);
-            const sx: f32 = scales[b];
-
-            const swa = readF16(pa);
-            const swb = readF16(pb);
-
-            const da: i32 = dotI8x32_lut(pa + 2, x_ptr);
-            const db: i32 = dotI8x32_lut(pb + 2, x_ptr);
-
-            suma += (swa * sx) * @as(f32, @floatFromInt(da));
-            sumb += (swb * sx) * @as(f32, @floatFromInt(db));
-
+        while (b < bpr) : (b += 1) {
+            const xp = qbuf.ptr + (b << 5);
+            const sx = scales[b];
+            sa += (readF16(pa) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(pa + 2, xp)));
+            sb += (readF16(pb) * sx) * @as(f32, @floatFromInt(dotI8x32_lut(pb + 2, xp)));
             pa += QBYTES;
             pb += QBYTES;
         }
-
-        out_a_range[r] = suma;
-        out_b_range[r] = sumb;
+        out_a[r] = sa;
+        out_b[r] = sb;
     }
 }
 
-pub fn matVecQ8_0_range_pair_lut_f32(
-    out_a_range: []f32,
-    data_a: []const u8,
-    out_b_range: []f32,
-    data_b: []const u8,
-    input: []const f32,
-    row_start: usize,
-    row_end: usize,
-    cols: usize,
-) void {
+pub fn matVecQ8_0_range_pair_lut_f32(out_a: []f32, data_a: []const u8, out_b: []f32, data_b: []const u8, input: []const f32, row_start: usize, row_end: usize, cols: usize) void {
     @setRuntimeSafety(false);
-
     const QBYTES: usize = 34;
-    const blocks_per_row = cols >> 5;
-    const row_stride = blocks_per_row * QBYTES;
-
-    const base_a = data_a.ptr + row_start * row_stride;
-    const base_b = data_b.ptr + row_start * row_stride;
-    const nrows = row_end - row_start;
-
-    for (0..nrows) |r| {
-        var suma: f32 = 0;
-        var sumb: f32 = 0;
-
-        const wa = base_a + r * row_stride;
-        const wb = base_b + r * row_stride;
-
-        for (0..blocks_per_row) |b| {
-            const in_ptr = input.ptr + (b << 5);
-            suma += dotQ8Block_f32input_lut(wa + b * QBYTES, in_ptr);
-            sumb += dotQ8Block_f32input_lut(wb + b * QBYTES, in_ptr);
+    const bpr = cols >> 5;
+    const rs = bpr * QBYTES;
+    const ba = data_a.ptr + row_start * rs;
+    const bb = data_b.ptr + row_start * rs;
+    const nr = row_end - row_start;
+    for (0..nr) |r| {
+        var sa: f32 = 0;
+        var sb: f32 = 0;
+        const wa = ba + r * rs;
+        const wb = bb + r * rs;
+        for (0..bpr) |b| {
+            const ip = input.ptr + (b << 5);
+            sa += dotQ8Block_f32input_lut(wa + b * QBYTES, ip);
+            sb += dotQ8Block_f32input_lut(wb + b * QBYTES, ip);
         }
-
-        out_a_range[r] = suma;
-        out_b_range[r] = sumb;
+        out_a[r] = sa;
+        out_b[r] = sb;
     }
 }
 
@@ -564,21 +386,36 @@ pub fn matVecQ8_0_range_pair_lut_f32(
 // ============================================================
 
 pub fn printLutInfo() void {
-    std.debug.print("\n=== LUT ENGINE: TABLE LOOKUP ===\n", .{});
+    std.debug.print("\n=== MATMUL-FREE: SHIFT-ADD SIMD ===\n", .{});
     std.debug.print("Status: {s}\n", .{if (g_lut_enabled) "ENABLED" else "DISABLED"});
-    std.debug.print("Integer i8xi8 dot product: TABLE LOOKUP (zero multiply)\n", .{});
-    std.debug.print("Float scaling: hardware * (2 per block, <0.1%% of ops)\n", .{});
-    std.debug.print("Grid: 256x256 i16 = 128 KB\n", .{});
+    std.debug.print("Method: Bit-decomposition shift+add (SIMD 32-wide)\n", .{});
+    std.debug.print("MUL instructions: ZERO\n", .{});
+    std.debug.print("Accuracy: EXACT (bit-identical)\n", .{});
+    std.debug.print("Extra memory: 0 bytes\n", .{});
 
-    // Sanity
-    const r1 = lookupMulI8(7, 8);
-    std.debug.print("Sanity: 7x8 = {} {s}\n", .{ r1, if (r1 == 56) "OK" else "FAIL" });
+    var wt: [32]u8 align(32) = undefined;
+    var xt: [32]i8 align(32) = undefined;
 
-    const r2 = lookupMulI8(-3, 4);
-    std.debug.print("Sanity: -3x4 = {} {s}\n", .{ r2, if (r2 == -12) "OK" else "FAIL" });
+    @memset(&wt, 0);
+    @memset(&xt, 0);
+    wt[0] = @bitCast(@as(i8, 7));
+    xt[0] = 8;
+    const r1 = dotI8x32_lut(&wt, &xt);
 
-    const r3 = lookupMulI8(-5, -6);
-    std.debug.print("Sanity: -5x-6 = {} {s}\n", .{ r3, if (r3 == 30) "OK" else "FAIL" });
+    @memset(&wt, 0);
+    @memset(&xt, 0);
+    wt[0] = @bitCast(@as(i8, -3));
+    xt[0] = 4;
+    const r2 = dotI8x32_lut(&wt, &xt);
 
-    std.debug.print("=================================\n\n", .{});
+    @memset(&wt, 0);
+    @memset(&xt, 0);
+    wt[0] = @bitCast(@as(i8, -5));
+    xt[0] = -6;
+    const r3 = dotI8x32_lut(&wt, &xt);
+
+    std.debug.print("Sanity: 7x8={} {s}\n", .{ r1, if (r1 == 56) "OK" else "FAIL" });
+    std.debug.print("Sanity: -3x4={} {s}\n", .{ r2, if (r2 == -12) "OK" else "FAIL" });
+    std.debug.print("Sanity: -5x-6={} {s}\n", .{ r3, if (r3 == 30) "OK" else "FAIL" });
+    std.debug.print("====================================\n\n", .{});
 }

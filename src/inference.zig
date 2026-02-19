@@ -1,13 +1,10 @@
+// src/inference.zig — SIMD-optimized ops
 const std = @import("std");
 const LlamaModel = @import("model.zig").LlamaModel;
 const Tensor = @import("tensor.zig").Tensor;
 const KVCache = @import("kv_cache.zig").KVCache;
 const tensor_ops = @import("tensor.zig");
 const validation = @import("validation.zig");
-
-// =============================================================================
-// Profiling
-// =============================================================================
 
 pub const ProfileStats = struct {
     matmul_ns: u64 = 0,
@@ -17,7 +14,6 @@ pub const ProfileStats = struct {
     embed_ns: u64 = 0,
     other_ns: u64 = 0,
     total_calls: u64 = 0,
-
     logits_calls: u64 = 0,
 
     pub fn print(self: *const ProfileStats) void {
@@ -26,34 +22,23 @@ pub const ProfileStats = struct {
         if (total == 0) return;
 
         std.debug.print("\n=== PROFILING BREAKDOWN ===\n", .{});
-        std.debug.print("Embed:           {:>10.2} ms ({:>5.1}%)\n", .{
-            @as(f64, @floatFromInt(self.embed_ns)) / 1_000_000,
-            @as(f64, @floatFromInt(self.embed_ns)) / @as(f64, @floatFromInt(total)) * 100,
-        });
-        std.debug.print("MatMul:          {:>10.2} ms ({:>5.1}%)\n", .{
-            @as(f64, @floatFromInt(self.matmul_ns)) / 1_000_000,
-            @as(f64, @floatFromInt(self.matmul_ns)) / @as(f64, @floatFromInt(total)) * 100,
-        });
-        std.debug.print("Attention:       {:>10.2} ms ({:>5.1}%)\n", .{
-            @as(f64, @floatFromInt(self.attention_ns)) / 1_000_000,
-            @as(f64, @floatFromInt(self.attention_ns)) / @as(f64, @floatFromInt(total)) * 100,
-        });
-        std.debug.print("RMSNorm:         {:>10.2} ms ({:>5.1}%)\n", .{
-            @as(f64, @floatFromInt(self.rmsnorm_ns)) / 1_000_000,
-            @as(f64, @floatFromInt(self.rmsnorm_ns)) / @as(f64, @floatFromInt(total)) * 100,
-        });
-        std.debug.print("FFN:             {:>10.2} ms ({:>5.1}%)\n", .{
-            @as(f64, @floatFromInt(self.ffn_ns)) / 1_000_000,
-            @as(f64, @floatFromInt(self.ffn_ns)) / @as(f64, @floatFromInt(total)) * 100,
-        });
-        std.debug.print("Other:           {:>10.2} ms ({:>5.1}%)\n", .{
-            @as(f64, @floatFromInt(self.other_ns)) / 1_000_000,
-            @as(f64, @floatFromInt(self.other_ns)) / @as(f64, @floatFromInt(total)) * 100,
-        });
+        printLine("Embed", self.embed_ns, total);
+        printLine("MatMul", self.matmul_ns, total);
+        printLine("Attention", self.attention_ns, total);
+        printLine("RMSNorm", self.rmsnorm_ns, total);
+        printLine("FFN", self.ffn_ns, total);
+        printLine("Other", self.other_ns, total);
         std.debug.print("Logits calls:     {}\n", .{self.logits_calls});
         std.debug.print("Total:           {:>10.2} ms ({} forward calls)\n", .{
-            @as(f64, @floatFromInt(total)) / 1_000_000,
-            self.total_calls,
+            @as(f64, @floatFromInt(total)) / 1_000_000, self.total_calls,
+        });
+    }
+
+    fn printLine(name: []const u8, ns: u64, total: u64) void {
+        std.debug.print("{s:<17}{:>10.2} ms ({:>5.1}%)\n", .{
+            name,
+            @as(f64, @floatFromInt(ns)) / 1_000_000,
+            @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(total)) * 100,
         });
     }
 
@@ -62,19 +47,29 @@ pub const ProfileStats = struct {
     }
 };
 
-// =============================================================================
-// Errors
-// =============================================================================
-
 pub const InferenceError = error{
     TokenOutOfRange,
     ContextLengthExceeded,
     CacheOutOfBounds,
 };
 
-// =============================================================================
+// ============================================================
+// SIMD types for vectorized ops
+// ============================================================
+
+const SimdF32 = @Vector(8, f32);
+
+inline fn loadF32x8(ptr: [*]const f32) SimdF32 {
+    return @as(*align(1) const SimdF32, @ptrCast(ptr)).*;
+}
+
+inline fn storeF32x8(ptr: [*]f32, v: SimdF32) void {
+    @as(*align(1) SimdF32, @ptrCast(ptr)).* = v;
+}
+
+// ============================================================
 // State
-// =============================================================================
+// ============================================================
 
 pub const InferenceState = struct {
     model: *LlamaModel,
@@ -93,65 +88,42 @@ pub const InferenceState = struct {
 
     profile_stats: ProfileStats,
     profiling_enabled: bool,
-
-    // Validasi (boleh dimatikan buat benchmark)
     validation_enabled: bool,
     validator: validation.Validator,
-
-    // Threading
     n_threads: usize,
-
-    // Optional toggles: MT untuk WO/W2 (default OFF karena run kamu tidak membaik)
     mt_wo_enabled: bool,
     mt_w2_enabled: bool,
-
     allocator: std.mem.Allocator,
 
     pub fn init(model_ptr: *LlamaModel, allocator: std.mem.Allocator) !InferenceState {
         const cfg = model_ptr.config;
         const kv_dim = cfg.dim / cfg.n_heads * cfg.n_kv_heads;
 
-        var kv_cache = try KVCache.init(
-            allocator,
-            cfg.n_layers,
-            cfg.max_seq_len,
-            cfg.n_kv_heads,
-            cfg.dim / cfg.n_heads,
-        );
+        var kv_cache = try KVCache.init(allocator, cfg.n_layers, cfg.max_seq_len, cfg.n_kv_heads, cfg.dim / cfg.n_heads);
         errdefer kv_cache.deinit();
 
         var x = try Tensor.zeros(allocator, &.{cfg.dim});
         errdefer x.deinit();
-
         var xb = try Tensor.zeros(allocator, &.{cfg.dim});
         errdefer xb.deinit();
-
         var xb2 = try Tensor.zeros(allocator, &.{cfg.dim});
         errdefer xb2.deinit();
-
-        var q = try Tensor.zeros(allocator, &.{cfg.dim});
-        errdefer q.deinit();
-
-        var k_tensor = try Tensor.zeros(allocator, &.{kv_dim});
-        errdefer k_tensor.deinit();
-
-        var v_tensor = try Tensor.zeros(allocator, &.{kv_dim});
-        errdefer v_tensor.deinit();
-
-        var attn = try Tensor.zeros(allocator, &.{ cfg.n_heads, cfg.max_seq_len });
-        errdefer attn.deinit();
-
-        var logits_tensor = try Tensor.zeros(allocator, &.{cfg.vocab_size});
-        errdefer logits_tensor.deinit();
-
-        var ffn_hidden = try Tensor.zeros(allocator, &.{cfg.ffn_hidden_dim});
-        errdefer ffn_hidden.deinit();
-
-        var ffn_hidden2 = try Tensor.zeros(allocator, &.{cfg.ffn_hidden_dim});
-        errdefer ffn_hidden2.deinit();
+        var q_t = try Tensor.zeros(allocator, &.{cfg.dim});
+        errdefer q_t.deinit();
+        var k_t = try Tensor.zeros(allocator, &.{kv_dim});
+        errdefer k_t.deinit();
+        var v_t = try Tensor.zeros(allocator, &.{kv_dim});
+        errdefer v_t.deinit();
+        var attn_t = try Tensor.zeros(allocator, &.{ cfg.n_heads, cfg.max_seq_len });
+        errdefer attn_t.deinit();
+        var logits_t = try Tensor.zeros(allocator, &.{cfg.vocab_size});
+        errdefer logits_t.deinit();
+        var ffn1 = try Tensor.zeros(allocator, &.{cfg.ffn_hidden_dim});
+        errdefer ffn1.deinit();
+        var ffn2 = try Tensor.zeros(allocator, &.{cfg.ffn_hidden_dim});
+        errdefer ffn2.deinit();
 
         const cpu_threads = std.Thread.getCpuCount() catch 1;
-        const use_threads: usize = @min(cpu_threads, 8);
 
         return .{
             .model = model_ptr,
@@ -159,26 +131,20 @@ pub const InferenceState = struct {
             .x = x,
             .xb = xb,
             .xb2 = xb2,
-            .q = q,
-            .k = k_tensor,
-            .v = v_tensor,
-            .attn = attn,
-            .logits = logits_tensor,
-            .ffn_hidden = ffn_hidden,
-            .ffn_hidden2 = ffn_hidden2,
+            .q = q_t,
+            .k = k_t,
+            .v = v_t,
+            .attn = attn_t,
+            .logits = logits_t,
+            .ffn_hidden = ffn1,
+            .ffn_hidden2 = ffn2,
             .profile_stats = .{},
-            // default OFF untuk speed; aktifkan dari main pakai --profile
             .profiling_enabled = false,
-
             .validation_enabled = true,
             .validator = validation.Validator.initDefault(),
-
-            .n_threads = use_threads,
-
-            // default OFF (berdasarkan hasil run kamu)
-            .mt_wo_enabled = false,
-            .mt_w2_enabled = false,
-
+            .n_threads = @min(cpu_threads, 8),
+            .mt_wo_enabled = true,
+            .mt_w2_enabled = true,
             .allocator = allocator,
         };
     }
@@ -217,6 +183,7 @@ pub const InferenceState = struct {
         const head_dim = cfg.dim / cfg.n_heads;
         const kv_dim = (cfg.dim / cfg.n_heads) * cfg.n_kv_heads;
         const dim = cfg.dim;
+        const nt = self.n_threads;
 
         if (self.validation_enabled) {
             self.validator.validateToken(token, cfg.vocab_size) catch return InferenceError.TokenOutOfRange;
@@ -238,94 +205,56 @@ pub const InferenceState = struct {
             rmsNorm(self.xb.data, self.x.data, layer.attn_norm.data, cfg.rms_norm_eps);
             if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
 
-            // QKV (single-thread; biasanya tidak worth MT kalau MT impl-nya berat)
-            tensor_ops.quantizedMatVec(self.q.data, &layer.wq, self.xb.data, cfg.dim, cfg.dim);
-            tensor_ops.quantizedMatVec(self.k.data, &layer.wk, self.xb.data, kv_dim, cfg.dim);
-            tensor_ops.quantizedMatVec(self.v.data, &layer.wv, self.xb.data, kv_dim, cfg.dim);
+            // QKV — all MT
+            tensor_ops.quantizedMatVecMt(self.q.data, &layer.wq, self.xb.data, cfg.dim, cfg.dim, nt);
+            tensor_ops.quantizedMatVecMt(self.k.data, &layer.wk, self.xb.data, kv_dim, cfg.dim, nt);
+            tensor_ops.quantizedMatVecMt(self.v.data, &layer.wv, self.xb.data, kv_dim, cfg.dim, nt);
 
             if (layer.bq) |bq| addBias(self.q.data, bq.data);
             if (layer.bk) |bk| addBias(self.k.data, bk.data);
             if (layer.bv) |bv| addBias(self.v.data, bv.data);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
-            // RoPE
             tensor_ops.applyRoPE(self.q.data, self.k.data, pos, head_dim, cfg.n_heads, cfg.n_kv_heads, cfg.rope_theta);
 
-            // KV cache
             self.kv_cache.update(layer_idx, self.k, self.v, pos) catch return InferenceError.CacheOutOfBounds;
             if (timer) |*t| self.profile_stats.other_ns += t.lap();
 
-            // attention
             self.attention(layer_idx, pos);
             if (timer) |*t| self.profile_stats.attention_ns += t.lap();
 
-            // WO (default single-thread; bisa MT via flag)
-            if (self.mt_wo_enabled and self.n_threads > 1) {
-                tensor_ops.quantizedMatVecMt(self.xb2.data, &layer.wo, self.xb.data, cfg.dim, cfg.dim, self.n_threads);
-            } else {
-                tensor_ops.quantizedMatVec(self.xb2.data, &layer.wo, self.xb.data, cfg.dim, cfg.dim);
-            }
+            // WO — MT
+            tensor_ops.quantizedMatVecMt(self.xb2.data, &layer.wo, self.xb.data, cfg.dim, cfg.dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
-            add(self.x.data, self.xb2.data);
+            addVec(self.x.data, self.xb2.data);
 
-            // ffn norm
             rmsNorm(self.xb.data, self.x.data, layer.ffn_norm.data, cfg.rms_norm_eps);
             if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
 
-            // FFN w1 + w3: FUSED + MT (sudah bagus)
-            tensor_ops.quantizedMatVec2Mt(
-                self.ffn_hidden.data,
-                &layer.w1,
-                self.ffn_hidden2.data,
-                &layer.w3,
-                self.xb.data,
-                cfg.ffn_hidden_dim,
-                cfg.dim,
-                self.n_threads,
-            );
+            // FFN w1+w3 fused MT
+            tensor_ops.quantizedMatVec2Mt(self.ffn_hidden.data, &layer.w1, self.ffn_hidden2.data, &layer.w3, self.xb.data, cfg.ffn_hidden_dim, cfg.dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
             siluMul(self.ffn_hidden.data, self.ffn_hidden2.data);
             if (timer) |*t| self.profile_stats.ffn_ns += t.lap();
 
-            // W2 (default single-thread; bisa MT via flag)
-            if (self.mt_w2_enabled and self.n_threads > 1) {
-                tensor_ops.quantizedMatVecMt(
-                    self.xb.data,
-                    &layer.w2,
-                    self.ffn_hidden.data,
-                    cfg.dim,
-                    cfg.ffn_hidden_dim,
-                    self.n_threads,
-                );
-            } else {
-                tensor_ops.quantizedMatVec(self.xb.data, &layer.w2, self.ffn_hidden.data, cfg.dim, cfg.ffn_hidden_dim);
-            }
+            // W2 — MT
+            tensor_ops.quantizedMatVecMt(self.xb.data, &layer.w2, self.ffn_hidden.data, cfg.dim, cfg.ffn_hidden_dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
-            add(self.x.data, self.xb.data);
+            addVec(self.x.data, self.xb.data);
             if (timer) |*t| self.profile_stats.other_ns += t.lap();
         }
 
         // 3) final norm + logits
         if (compute_logits) {
             self.profile_stats.logits_calls += 1;
-
             rmsNorm(self.x.data, self.x.data, m.norm.data, cfg.rms_norm_eps);
             if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
 
             const output_weight = if (m.use_tied_embeddings) &m.tok_embeddings else &m.output;
-
-            // lm_head: selalu MT (ini yang paling besar)
-            tensor_ops.quantizedMatVecMt(
-                self.logits.data,
-                output_weight,
-                self.x.data,
-                cfg.vocab_size,
-                cfg.dim,
-                self.n_threads,
-            );
+            tensor_ops.quantizedMatVecMt(self.logits.data, output_weight, self.x.data, cfg.vocab_size, cfg.dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
         }
 
@@ -334,6 +263,7 @@ pub const InferenceState = struct {
     }
 
     fn attention(self: *InferenceState, layer_idx: usize, pos: usize) void {
+        @setRuntimeSafety(false);
         const cfg = self.model.config;
         const head_dim = cfg.dim / cfg.n_heads;
         const seq_len = pos + 1;
@@ -342,8 +272,8 @@ pub const InferenceState = struct {
 
         @memset(self.xb.data, 0);
 
-        const k_cache_base = self.kv_cache.key_cache[layer_idx].data.ptr;
-        const v_cache_base = self.kv_cache.value_cache[layer_idx].data.ptr;
+        const k_cache = self.kv_cache.key_cache[layer_idx].data.ptr;
+        const v_cache = self.kv_cache.value_cache[layer_idx].data.ptr;
         const kv_stride = n_kv_heads * head_dim;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
@@ -354,71 +284,139 @@ pub const InferenceState = struct {
             const kv_head_idx = h / kv_head_ratio;
             const kv_offset = kv_head_idx * head_dim;
 
-            // Q @ K^T
+            // Q @ K^T — SIMD dot product
             for (0..seq_len) |t| {
-                const k_head = k_cache_base + t * kv_stride + kv_offset;
-                var sum: f32 = 0;
-                for (0..head_dim) |j| sum += q_head[j] * k_head[j];
-                attn_scores[t] = sum * scale;
+                const k_head = k_cache + t * kv_stride + kv_offset;
+                attn_scores[t] = dotF32(q_head.ptr, k_head, head_dim) * scale;
             }
 
             softmax(attn_scores);
 
-            // attn @ V
+            // attn @ V — SIMD scatter-add
             const xb_head = self.xb.data[h * head_dim ..][0..head_dim];
             for (0..seq_len) |t| {
-                const v_head = v_cache_base + t * kv_stride + kv_offset;
+                const v_head = v_cache + t * kv_stride + kv_offset;
                 const w = attn_scores[t];
-                for (0..head_dim) |j| xb_head[j] += w * v_head[j];
+                axpy(xb_head.ptr, v_head, w, head_dim);
             }
         }
     }
 };
 
-// =============================================================================
-// Ops
-// =============================================================================
+// ============================================================
+// SIMD-optimized ops
+// ============================================================
+
+/// SIMD dot product f32
+fn dotF32(a: [*]const f32, b: [*]const f32, n: usize) f32 {
+    @setRuntimeSafety(false);
+    var acc0: SimdF32 = @splat(0);
+    var acc1: SimdF32 = @splat(0);
+    var i: usize = 0;
+    while (i + 16 <= n) : (i += 16) {
+        acc0 += loadF32x8(a + i) * loadF32x8(b + i);
+        acc1 += loadF32x8(a + i + 8) * loadF32x8(b + i + 8);
+    }
+    while (i + 8 <= n) : (i += 8) {
+        acc0 += loadF32x8(a + i) * loadF32x8(b + i);
+    }
+    var sum = @reduce(.Add, acc0 + acc1);
+    while (i < n) : (i += 1) sum += a[i] * b[i];
+    return sum;
+}
+
+/// SIMD axpy: y += a * x
+fn axpy(y: [*]f32, x: [*]const f32, a: f32, n: usize) void {
+    @setRuntimeSafety(false);
+    const va: SimdF32 = @splat(a);
+    var i: usize = 0;
+    while (i + 16 <= n) : (i += 16) {
+        storeF32x8(y + i, loadF32x8(y + i) + va * loadF32x8(x + i));
+        storeF32x8(y + i + 8, loadF32x8(y + i + 8) + va * loadF32x8(x + i + 8));
+    }
+    while (i + 8 <= n) : (i += 8) {
+        storeF32x8(y + i, loadF32x8(y + i) + va * loadF32x8(x + i));
+    }
+    while (i < n) : (i += 1) y[i] += a * x[i];
+}
 
 fn addBias(out: []f32, bias: []const f32) void {
+    @setRuntimeSafety(false);
     const n = @min(out.len, bias.len);
-    for (0..n) |i| out[i] += bias[i];
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        storeF32x8(out.ptr + i, loadF32x8(out.ptr + i) + loadF32x8(bias.ptr + i));
+    }
+    while (i < n) : (i += 1) out[i] += bias[i];
 }
 
 fn rmsNorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
+    @setRuntimeSafety(false);
     const n = x.len;
+    var acc: SimdF32 = @splat(0);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const v = loadF32x8(x.ptr + i);
+        acc += v * v;
+    }
+    var ss = @reduce(.Add, acc);
+    while (i < n) : (i += 1) ss += x[i] * x[i];
 
-    var ss: f32 = 0;
-    for (x) |v| ss += v * v;
-
-    const scale = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(n)) + eps);
-
-    for (0..n) |i| out[i] = x[i] * scale * w[i];
+    const s = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(n)) + eps);
+    i = 0;
+    while (i + 8 <= n) : (i += 8) {
+        storeF32x8(out.ptr + i, loadF32x8(x.ptr + i) * loadF32x8(w.ptr + i) * @as(SimdF32, @splat(s)));
+    }
+    while (i < n) : (i += 1) out[i] = x[i] * s * w[i];
 }
 
 fn softmax(x: []f32) void {
+    @setRuntimeSafety(false);
     if (x.len == 0) return;
+    const n = x.len;
 
-    var max_val = x[0];
-    for (x[1..]) |v| max_val = @max(max_val, v);
+    // Find max — SIMD
+    var max_vec: SimdF32 = @splat(-std.math.inf(f32));
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        max_vec = @max(max_vec, loadF32x8(x.ptr + i));
+    }
+    var max_val = @reduce(.Max, max_vec);
+    while (i < n) : (i += 1) max_val = @max(max_val, x[i]);
 
+    // Exp + sum
     var sum: f32 = 0;
     for (x) |*v| {
         v.* = @exp(v.* - max_val);
         sum += v.*;
     }
 
+    // Normalize — SIMD
     if (sum > 0) {
-        for (x) |*v| v.* /= sum;
+        const inv_sum: SimdF32 = @splat(1.0 / sum);
+        i = 0;
+        while (i + 8 <= n) : (i += 8) {
+            storeF32x8(x.ptr + i, loadF32x8(x.ptr + i) * inv_sum);
+        }
+        while (i < n) : (i += 1) x[i] /= sum;
     }
 }
 
-fn add(a: []f32, b: []const f32) void {
+fn addVec(a: []f32, b: []const f32) void {
+    @setRuntimeSafety(false);
     const n = @min(a.len, b.len);
-    for (0..n) |i| a[i] += b[i];
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        storeF32x8(a.ptr + i, loadF32x8(a.ptr + i) + loadF32x8(b.ptr + i));
+    }
+    while (i < n) : (i += 1) a[i] += b[i];
 }
 
 fn siluMul(gate: []f32, up: []const f32) void {
+    @setRuntimeSafety(false);
     const n = @min(gate.len, up.len);
+    // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+    // Process scalar — exp not easily SIMD-able portably
     for (0..n) |i| {
         const g = gate[i];
         const sigmoid = 1.0 / (1.0 + @exp(-g));
