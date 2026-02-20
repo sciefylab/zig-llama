@@ -1,10 +1,13 @@
-// src/inference.zig — SIMD-optimized ops
+// src/inference.zig — SIMD-optimized ops with Batch Prefill
 const std = @import("std");
 const LlamaModel = @import("model.zig").LlamaModel;
 const Tensor = @import("tensor.zig").Tensor;
 const KVCache = @import("kv_cache.zig").KVCache;
 const tensor_ops = @import("tensor.zig");
 const validation = @import("validation.zig");
+const lut = @import("lut_mul.zig");
+
+const MAX_BATCH_SIZE: usize = 128;
 
 pub const ProfileStats = struct {
     matmul_ns: u64 = 0,
@@ -54,7 +57,7 @@ pub const InferenceError = error{
 };
 
 // ============================================================
-// SIMD types for vectorized ops
+// SIMD types
 // ============================================================
 
 const SimdF32 = @Vector(8, f32);
@@ -67,6 +70,11 @@ inline fn storeF32x8(ptr: [*]f32, v: SimdF32) void {
     @as(*align(1) SimdF32, @ptrCast(ptr)).* = v;
 }
 
+inline fn readF16_local(ptr: [*]const u8) f32 {
+    const bits: u16 = @as(u16, ptr[0]) | (@as(u16, ptr[1]) << 8);
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
 // ============================================================
 // State
 // ============================================================
@@ -75,6 +83,7 @@ pub const InferenceState = struct {
     model: *LlamaModel,
     kv_cache: KVCache,
 
+    // Single-token buffers
     x: Tensor,
     xb: Tensor,
     xb2: Tensor,
@@ -86,6 +95,18 @@ pub const InferenceState = struct {
     ffn_hidden: Tensor,
     ffn_hidden2: Tensor,
 
+    // Batch buffers
+    batch_x: []f32,
+    batch_xb: []f32,
+    batch_xb2: []f32,
+    batch_q: []f32,
+    batch_k: []f32,
+    batch_v: []f32,
+    batch_ffn1: []f32,
+    batch_ffn2: []f32,
+    batch_qbuf: []i8,
+    batch_qscales: []f32,
+
     profile_stats: ProfileStats,
     profiling_enabled: bool,
     validation_enabled: bool,
@@ -95,13 +116,18 @@ pub const InferenceState = struct {
     mt_w2_enabled: bool,
     allocator: std.mem.Allocator,
 
+    const ALIGNMENT = tensor_ops.ALIGNMENT;
+
     pub fn init(model_ptr: *LlamaModel, allocator: std.mem.Allocator) !InferenceState {
         const cfg = model_ptr.config;
         const kv_dim = cfg.dim / cfg.n_heads * cfg.n_kv_heads;
+        const max_dim = @max(cfg.dim, cfg.ffn_hidden_dim);
+        const max_blocks = max_dim / 32;
 
         var kv_cache = try KVCache.init(allocator, cfg.n_layers, cfg.max_seq_len, cfg.n_kv_heads, cfg.dim / cfg.n_heads);
         errdefer kv_cache.deinit();
 
+        // Single-token buffers
         var x = try Tensor.zeros(allocator, &.{cfg.dim});
         errdefer x.deinit();
         var xb = try Tensor.zeros(allocator, &.{cfg.dim});
@@ -123,6 +149,29 @@ pub const InferenceState = struct {
         var ffn2 = try Tensor.zeros(allocator, &.{cfg.ffn_hidden_dim});
         errdefer ffn2.deinit();
 
+        // Batch buffers
+        const B = MAX_BATCH_SIZE;
+        const b_x = try allocator.alignedAlloc(f32, ALIGNMENT, B * cfg.dim);
+        errdefer allocator.free(b_x);
+        const b_xb = try allocator.alignedAlloc(f32, ALIGNMENT, B * cfg.dim);
+        errdefer allocator.free(b_xb);
+        const b_xb2 = try allocator.alignedAlloc(f32, ALIGNMENT, B * cfg.dim);
+        errdefer allocator.free(b_xb2);
+        const b_q = try allocator.alignedAlloc(f32, ALIGNMENT, B * cfg.dim);
+        errdefer allocator.free(b_q);
+        const b_k = try allocator.alignedAlloc(f32, ALIGNMENT, B * kv_dim);
+        errdefer allocator.free(b_k);
+        const b_v = try allocator.alignedAlloc(f32, ALIGNMENT, B * kv_dim);
+        errdefer allocator.free(b_v);
+        const b_ffn1 = try allocator.alignedAlloc(f32, ALIGNMENT, B * cfg.ffn_hidden_dim);
+        errdefer allocator.free(b_ffn1);
+        const b_ffn2 = try allocator.alignedAlloc(f32, ALIGNMENT, B * cfg.ffn_hidden_dim);
+        errdefer allocator.free(b_ffn2);
+        const b_qbuf = try allocator.alignedAlloc(i8, ALIGNMENT, B * max_dim);
+        errdefer allocator.free(b_qbuf);
+        const b_qscales = try allocator.alignedAlloc(f32, ALIGNMENT, B * max_blocks);
+        errdefer allocator.free(b_qscales);
+
         const cpu_threads = std.Thread.getCpuCount() catch 1;
 
         return .{
@@ -138,6 +187,16 @@ pub const InferenceState = struct {
             .logits = logits_t,
             .ffn_hidden = ffn1,
             .ffn_hidden2 = ffn2,
+            .batch_x = b_x,
+            .batch_xb = b_xb,
+            .batch_xb2 = b_xb2,
+            .batch_q = b_q,
+            .batch_k = b_k,
+            .batch_v = b_v,
+            .batch_ffn1 = b_ffn1,
+            .batch_ffn2 = b_ffn2,
+            .batch_qbuf = b_qbuf,
+            .batch_qscales = b_qscales,
             .profile_stats = .{},
             .profiling_enabled = false,
             .validation_enabled = true,
@@ -161,6 +220,17 @@ pub const InferenceState = struct {
         self.logits.deinit();
         self.ffn_hidden.deinit();
         self.ffn_hidden2.deinit();
+        // Batch buffers
+        self.allocator.free(self.batch_x);
+        self.allocator.free(self.batch_xb);
+        self.allocator.free(self.batch_xb2);
+        self.allocator.free(self.batch_q);
+        self.allocator.free(self.batch_k);
+        self.allocator.free(self.batch_v);
+        self.allocator.free(self.batch_ffn1);
+        self.allocator.free(self.batch_ffn2);
+        self.allocator.free(self.batch_qbuf);
+        self.allocator.free(self.batch_qscales);
     }
 
     pub fn reset(self: *InferenceState) void {
@@ -168,6 +238,10 @@ pub const InferenceState = struct {
         for (self.kv_cache.value_cache) |*cache| @memset(cache.data, 0);
         self.profile_stats.reset();
     }
+
+    // ============================================================
+    // Single-token forward (unchanged)
+    // ============================================================
 
     pub fn forward(self: *InferenceState, token: u32, pos: usize) !Tensor {
         return self.forwardInternal(token, pos, true);
@@ -193,19 +267,16 @@ pub const InferenceState = struct {
         var timer: ?std.time.Timer = null;
         if (self.profiling_enabled) timer = std.time.Timer.start() catch null;
 
-        // 1) embedding
         switch (m.tok_embeddings.quant_type) {
             .Q8_0 => tensor_ops.embedTokenQ8_0(self.x.data, m.tok_embeddings.data, token, dim),
             .Q4_0, .Q4_1 => tensor_ops.embedTokenQ4_0(self.x.data, m.tok_embeddings.data, token, dim),
         }
         if (timer) |*t| self.profile_stats.embed_ns += t.lap();
 
-        // 2) layers
         for (m.layers, 0..) |*layer, layer_idx| {
             rmsNorm(self.xb.data, self.x.data, layer.attn_norm.data, cfg.rms_norm_eps);
             if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
 
-            // QKV — all MT
             tensor_ops.quantizedMatVecMt(self.q.data, &layer.wq, self.xb.data, cfg.dim, cfg.dim, nt);
             tensor_ops.quantizedMatVecMt(self.k.data, &layer.wk, self.xb.data, kv_dim, cfg.dim, nt);
             tensor_ops.quantizedMatVecMt(self.v.data, &layer.wv, self.xb.data, kv_dim, cfg.dim, nt);
@@ -223,7 +294,6 @@ pub const InferenceState = struct {
             self.attention(layer_idx, pos);
             if (timer) |*t| self.profile_stats.attention_ns += t.lap();
 
-            // WO — MT
             tensor_ops.quantizedMatVecMt(self.xb2.data, &layer.wo, self.xb.data, cfg.dim, cfg.dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
@@ -232,14 +302,12 @@ pub const InferenceState = struct {
             rmsNorm(self.xb.data, self.x.data, layer.ffn_norm.data, cfg.rms_norm_eps);
             if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
 
-            // FFN w1+w3 fused MT
             tensor_ops.quantizedMatVec2Mt(self.ffn_hidden.data, &layer.w1, self.ffn_hidden2.data, &layer.w3, self.xb.data, cfg.ffn_hidden_dim, cfg.dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
             siluMul(self.ffn_hidden.data, self.ffn_hidden2.data);
             if (timer) |*t| self.profile_stats.ffn_ns += t.lap();
 
-            // W2 — MT
             tensor_ops.quantizedMatVecMt(self.xb.data, &layer.w2, self.ffn_hidden.data, cfg.dim, cfg.ffn_hidden_dim, nt);
             if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
 
@@ -247,7 +315,6 @@ pub const InferenceState = struct {
             if (timer) |*t| self.profile_stats.other_ns += t.lap();
         }
 
-        // 3) final norm + logits
         if (compute_logits) {
             self.profile_stats.logits_calls += 1;
             rmsNorm(self.x.data, self.x.data, m.norm.data, cfg.rms_norm_eps);
@@ -261,6 +328,221 @@ pub const InferenceState = struct {
         self.profile_stats.total_calls += 1;
         return self.logits;
     }
+
+    // ============================================================
+    // Batch Prefill — reads weights ONCE for all tokens
+    // ============================================================
+
+    pub fn forwardBatch(self: *InferenceState, tokens: []const u32, start_pos: usize) !Tensor {
+        const B = tokens.len;
+        if (B == 0) return self.logits;
+        if (B == 1) return self.forward(tokens[0], start_pos);
+
+        // Fallback for large batches
+        if (B > MAX_BATCH_SIZE) {
+            for (tokens[0 .. B - 1], 0..) |tok_id, i| {
+                _ = try self.forwardInternal(tok_id, start_pos + i, false);
+            }
+            return self.forward(tokens[B - 1], start_pos + B - 1);
+        }
+
+        const m = self.model;
+        const cfg = m.config;
+        const dim: usize = cfg.dim;
+        const kv_dim: usize = (cfg.dim / cfg.n_heads) * cfg.n_kv_heads;
+        const head_dim: usize = cfg.dim / cfg.n_heads;
+        const ffn_dim: usize = cfg.ffn_hidden_dim;
+        const nt = self.n_threads;
+
+        var timer: ?std.time.Timer = null;
+        if (self.profiling_enabled) timer = std.time.Timer.start() catch null;
+
+        // 1. Embed all tokens
+        for (0..B) |t| {
+            const out_slice = self.batch_x[t * dim ..][0..dim];
+            switch (m.tok_embeddings.quant_type) {
+                .Q8_0 => tensor_ops.embedTokenQ8_0(out_slice, m.tok_embeddings.data, tokens[t], @intCast(dim)),
+                .Q4_0, .Q4_1 => tensor_ops.embedTokenQ4_0(out_slice, m.tok_embeddings.data, tokens[t], @intCast(dim)),
+            }
+        }
+        if (timer) |*t| self.profile_stats.embed_ns += t.lap();
+
+        // 2. Layer loop
+        for (m.layers, 0..) |*layer, layer_idx| {
+            // 2a. RMSNorm all tokens
+            for (0..B) |t| {
+                rmsNorm(
+                    self.batch_xb[t * dim ..][0..dim],
+                    self.batch_x[t * dim ..][0..dim],
+                    layer.attn_norm.data,
+                    cfg.rms_norm_eps,
+                );
+            }
+            if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
+
+            // 2b. Batched QKV — weight read ONCE for all B tokens
+            batchMatVecQ8_0(
+                self.batch_q,
+                layer.wq.data,
+                self.batch_xb,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                dim,
+                dim,
+            );
+            batchMatVecQ8_0(
+                self.batch_k,
+                layer.wk.data,
+                self.batch_xb,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                kv_dim,
+                dim,
+            );
+            batchMatVecQ8_0(
+                self.batch_v,
+                layer.wv.data,
+                self.batch_xb,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                kv_dim,
+                dim,
+            );
+            if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
+
+            // 2c. Per-token: bias, RoPE, KV cache, attention
+            for (0..B) |t| {
+                const pos = start_pos + t;
+                const q_slice = self.batch_q[t * dim ..][0..dim];
+                const k_slice = self.batch_k[t * kv_dim ..][0..kv_dim];
+                const v_slice = self.batch_v[t * kv_dim ..][0..kv_dim];
+
+                if (layer.bq) |bq| addBias(q_slice, bq.data);
+                if (layer.bk) |bk| addBias(k_slice, bk.data);
+                if (layer.bv) |bv| addBias(v_slice, bv.data);
+
+                tensor_ops.applyRoPE(q_slice, k_slice, pos, @intCast(head_dim), cfg.n_heads, cfg.n_kv_heads, cfg.rope_theta);
+
+                // Copy to single-token buffers for KV cache + attention
+                @memcpy(self.k.data[0..kv_dim], k_slice);
+                @memcpy(self.v.data[0..kv_dim], v_slice);
+                self.kv_cache.update(layer_idx, self.k, self.v, pos) catch {};
+
+                @memcpy(self.q.data[0..dim], q_slice);
+                self.attention(layer_idx, pos);
+                @memcpy(self.batch_xb[t * dim ..][0..dim], self.xb.data[0..dim]);
+            }
+            if (timer) |*t| {
+                self.profile_stats.attention_ns += t.lap();
+            }
+
+            // 2d. Batched WO
+            batchMatVecQ8_0(
+                self.batch_xb2,
+                layer.wo.data,
+                self.batch_xb,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                dim,
+                dim,
+            );
+            if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
+
+            // 2e. Residual
+            for (0..B) |t| {
+                addVec(
+                    self.batch_x[t * dim ..][0..dim],
+                    self.batch_xb2[t * dim ..][0..dim],
+                );
+            }
+
+            // 2f. FFN RMSNorm
+            for (0..B) |t| {
+                rmsNorm(
+                    self.batch_xb[t * dim ..][0..dim],
+                    self.batch_x[t * dim ..][0..dim],
+                    layer.ffn_norm.data,
+                    cfg.rms_norm_eps,
+                );
+            }
+            if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
+
+            // 2g. Batched FFN W1 + W3
+            batchMatVecQ8_0(
+                self.batch_ffn1,
+                layer.w1.data,
+                self.batch_xb,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                ffn_dim,
+                dim,
+            );
+            batchMatVecQ8_0(
+                self.batch_ffn2,
+                layer.w3.data,
+                self.batch_xb,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                ffn_dim,
+                dim,
+            );
+            if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
+
+            // 2h. SiLU * mul
+            for (0..B) |t| {
+                siluMul(
+                    self.batch_ffn1[t * ffn_dim ..][0..ffn_dim],
+                    self.batch_ffn2[t * ffn_dim ..][0..ffn_dim],
+                );
+            }
+            if (timer) |*t| self.profile_stats.ffn_ns += t.lap();
+
+            // 2i. Batched W2
+            batchMatVecQ8_0(
+                self.batch_xb,
+                layer.w2.data,
+                self.batch_ffn1,
+                self.batch_qbuf,
+                self.batch_qscales,
+                B,
+                dim,
+                ffn_dim,
+            );
+            if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
+
+            // 2j. Residual
+            for (0..B) |t| {
+                addVec(
+                    self.batch_x[t * dim ..][0..dim],
+                    self.batch_xb[t * dim ..][0..dim],
+                );
+            }
+            if (timer) |*t| self.profile_stats.other_ns += t.lap();
+        }
+
+        // 3. Final norm + logits for LAST token only
+        self.profile_stats.logits_calls += 1;
+        const last = B - 1;
+        rmsNorm(self.x.data, self.batch_x[last * dim ..][0..dim], m.norm.data, cfg.rms_norm_eps);
+        if (timer) |*t| self.profile_stats.rmsnorm_ns += t.lap();
+
+        const output_weight = if (m.use_tied_embeddings) &m.tok_embeddings else &m.output;
+        tensor_ops.quantizedMatVecMt(self.logits.data, output_weight, self.x.data, cfg.vocab_size, cfg.dim, nt);
+        if (timer) |*t| self.profile_stats.matmul_ns += t.lap();
+
+        self.profile_stats.total_calls += B;
+        return self.logits;
+    }
+
+    // ============================================================
+    // Attention (unchanged)
+    // ============================================================
 
     fn attention(self: *InferenceState, layer_idx: usize, pos: usize) void {
         @setRuntimeSafety(false);
@@ -284,7 +566,6 @@ pub const InferenceState = struct {
             const kv_head_idx = h / kv_head_ratio;
             const kv_offset = kv_head_idx * head_dim;
 
-            // Q @ K^T — SIMD dot product
             for (0..seq_len) |t| {
                 const k_head = k_cache + t * kv_stride + kv_offset;
                 attn_scores[t] = dotF32(q_head.ptr, k_head, head_dim) * scale;
@@ -292,7 +573,6 @@ pub const InferenceState = struct {
 
             softmax(attn_scores);
 
-            // attn @ V — SIMD scatter-add
             const xb_head = self.xb.data[h * head_dim ..][0..head_dim];
             for (0..seq_len) |t| {
                 const v_head = v_cache + t * kv_stride + kv_offset;
@@ -304,10 +584,85 @@ pub const InferenceState = struct {
 };
 
 // ============================================================
-// SIMD-optimized ops
+// Batched MatVec Q8_0 — reads weight matrix ONCE for all tokens
 // ============================================================
 
-/// SIMD dot product f32
+fn batchMatVecQ8_0(
+    out: []f32,
+    weight_data: []const u8,
+    batch_input: []const f32,
+    batch_qbuf: []i8,
+    batch_qscales: []f32,
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) void {
+    @setRuntimeSafety(false);
+    const QBLOCK: usize = 32;
+    const QBYTES: usize = 34;
+    const bpr = cols / QBLOCK;
+    const rs = bpr * QBYTES;
+
+    // Pre-quantize all batch inputs
+    for (0..batch) |t| {
+        const in_off = t * cols;
+        const q_off = t * cols;
+        const s_off = t * bpr;
+        var b: usize = 0;
+        while (b < bpr) : (b += 1) {
+            const base = b * QBLOCK;
+            var max_abs: f32 = 0;
+            for (0..QBLOCK) |i| {
+                const a = @abs(batch_input[in_off + base + i]);
+                if (a > max_abs) max_abs = a;
+            }
+            if (max_abs == 0) {
+                batch_qscales[s_off + b] = 0;
+                @memset(batch_qbuf[q_off + base ..][0..QBLOCK], 0);
+                continue;
+            }
+            const inv_val = 127.0 / max_abs;
+            batch_qscales[s_off + b] = max_abs / 127.0;
+            for (0..QBLOCK) |i| {
+                var qi: i32 = @intFromFloat(@round(batch_input[in_off + base + i] * inv_val));
+                if (qi > 127) qi = 127;
+                if (qi < -127) qi = -127;
+                batch_qbuf[q_off + base + i] = @intCast(qi);
+            }
+        }
+    }
+
+    // Batched matmul: read each weight block once, compute for all tokens
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        // Zero output for this row
+        for (0..batch) |t| {
+            out[t * rows + r] = 0;
+        }
+
+        var wp = weight_data.ptr + r * rs;
+        var b: usize = 0;
+        while (b < bpr) : (b += 1) {
+            const w_scale = readF16_local(wp);
+            const w_quants = wp + 2;
+
+            // Weight block now in L1 cache — reuse for all batch tokens
+            for (0..batch) |t| {
+                const x_ptr = batch_qbuf[t * cols + b * QBLOCK ..].ptr;
+                const x_scale = batch_qscales[t * bpr + b];
+                const dot = lut.dotI8x32_best(w_quants, x_ptr);
+                out[t * rows + r] += (w_scale * x_scale) * @as(f32, @floatFromInt(dot));
+            }
+
+            wp += QBYTES;
+        }
+    }
+}
+
+// ============================================================
+// SIMD-optimized ops (unchanged)
+// ============================================================
+
 fn dotF32(a: [*]const f32, b: [*]const f32, n: usize) f32 {
     @setRuntimeSafety(false);
     var acc0: SimdF32 = @splat(0);
@@ -325,7 +680,6 @@ fn dotF32(a: [*]const f32, b: [*]const f32, n: usize) f32 {
     return sum;
 }
 
-/// SIMD axpy: y += a * x
 fn axpy(y: [*]f32, x: [*]const f32, a: f32, n: usize) void {
     @setRuntimeSafety(false);
     const va: SimdF32 = @splat(a);
@@ -356,8 +710,8 @@ fn rmsNorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
     var acc: SimdF32 = @splat(0);
     var i: usize = 0;
     while (i + 8 <= n) : (i += 8) {
-        const v = loadF32x8(x.ptr + i);
-        acc += v * v;
+        const v_val = loadF32x8(x.ptr + i);
+        acc += v_val * v_val;
     }
     var ss = @reduce(.Add, acc);
     while (i < n) : (i += 1) ss += x[i] * x[i];
@@ -375,7 +729,6 @@ fn softmax(x: []f32) void {
     if (x.len == 0) return;
     const n = x.len;
 
-    // Find max — SIMD
     var max_vec: SimdF32 = @splat(-std.math.inf(f32));
     var i: usize = 0;
     while (i + 8 <= n) : (i += 8) {
@@ -384,14 +737,12 @@ fn softmax(x: []f32) void {
     var max_val = @reduce(.Max, max_vec);
     while (i < n) : (i += 1) max_val = @max(max_val, x[i]);
 
-    // Exp + sum
     var sum: f32 = 0;
     for (x) |*v| {
         v.* = @exp(v.* - max_val);
         sum += v.*;
     }
 
-    // Normalize — SIMD
     if (sum > 0) {
         const inv_sum: SimdF32 = @splat(1.0 / sum);
         i = 0;
@@ -415,8 +766,6 @@ fn addVec(a: []f32, b: []const f32) void {
 fn siluMul(gate: []f32, up: []const f32) void {
     @setRuntimeSafety(false);
     const n = @min(gate.len, up.len);
-    // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
-    // Process scalar — exp not easily SIMD-able portably
     for (0..n) |i| {
         const g = gate[i];
         const sigmoid = 1.0 / (1.0 + @exp(-g));

@@ -1,5 +1,6 @@
-// src/model.zig
+// src/model.zig — Optimized weight loading (no double allocation)
 const std = @import("std");
+const builtin = @import("builtin");
 const gguf = @import("gguf.zig");
 
 const Tensor = @import("tensor.zig").Tensor;
@@ -87,22 +88,16 @@ pub const LlamaModel = struct {
     output: QuantizedTensor,
     use_tied_embeddings: bool,
     allocator: std.mem.Allocator,
-    file_data: []u8,
 
     pub fn fromGGUF(gguf_file: *gguf.GGUFFile, allocator: std.mem.Allocator) !LlamaModel {
         var config = ModelConfig.fromGGUF(gguf_file);
 
+        // Open file for direct reading — no full file buffer
         const file = try std.fs.cwd().openFile(gguf_file.file_path, .{});
         defer file.close();
 
         const file_size = try file.getEndPos();
-        const file_data = try allocator.alloc(u8, file_size);
-        errdefer allocator.free(file_data);
-
-        const bytes_read = try file.readAll(file_data);
-        if (bytes_read != file_size) return error.IncompleteRead;
-
-        std.debug.print("  File loaded: {d:.2} MB\n", .{@as(f64, @floatFromInt(file_size)) / 1048576.0});
+        std.debug.print("  File size: {d:.2} MB\n", .{@as(f64, @floatFromInt(file_size)) / 1048576.0});
 
         if (gguf_file.getTensorByName("token_embd.weight")) |emb_info| {
             if (emb_info.n_dims >= 2) config.vocab_size = @intCast(emb_info.dims[1]);
@@ -120,18 +115,18 @@ pub const LlamaModel = struct {
             var nb: [128]u8 = undefined;
 
             layers[li] = .{
-                .wq = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_q.weight", li),
-                .wk = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_k.weight", li),
-                .wv = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_v.weight", li),
-                .wo = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_output.weight", li),
-                .bq = loadFT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_q.bias", li),
-                .bk = loadFT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_k.bias", li),
-                .bv = loadFT(gguf_file, file_data, allocator, &nb, "blk.{}.attn_v.bias", li),
-                .w1 = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_gate.weight", li),
-                .w2 = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_down.weight", li),
-                .w3 = try loadQT(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_up.weight", li),
-                .attn_norm = try loadFTReq(gguf_file, file_data, allocator, &nb, "blk.{}.attn_norm.weight", li),
-                .ffn_norm = try loadFTReq(gguf_file, file_data, allocator, &nb, "blk.{}.ffn_norm.weight", li),
+                .wq = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.attn_q.weight", li),
+                .wk = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.attn_k.weight", li),
+                .wv = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.attn_v.weight", li),
+                .wo = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.attn_output.weight", li),
+                .bq = loadFT(gguf_file, file, allocator, &nb, "blk.{}.attn_q.bias", li),
+                .bk = loadFT(gguf_file, file, allocator, &nb, "blk.{}.attn_k.bias", li),
+                .bv = loadFT(gguf_file, file, allocator, &nb, "blk.{}.attn_v.bias", li),
+                .w1 = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.ffn_gate.weight", li),
+                .w2 = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.ffn_down.weight", li),
+                .w3 = try loadQT(gguf_file, file, allocator, &nb, "blk.{}.ffn_up.weight", li),
+                .attn_norm = try loadFTReq(gguf_file, file, allocator, &nb, "blk.{}.attn_norm.weight", li),
+                .ffn_norm = try loadFTReq(gguf_file, file, allocator, &nb, "blk.{}.ffn_norm.weight", li),
             };
 
             if (li == 0 and layers[0].bq != null)
@@ -139,12 +134,12 @@ pub const LlamaModel = struct {
         }
 
         std.debug.print("  Loading token embeddings (Q8_0)...\n", .{});
-        const tok_emb = try loadQTByName(gguf_file, file_data, allocator, "token_embd.weight");
+        const tok_emb = try loadQTByName(gguf_file, file, allocator, "token_embd.weight");
         if (tok_emb.shape.len >= 2) config.vocab_size = tok_emb.shape[1];
 
         std.debug.print("  Loading output projection...\n", .{});
         var use_tied = false;
-        const output = loadQTByName(gguf_file, file_data, allocator, "output.weight") catch |err| blk: {
+        const output = loadQTByName(gguf_file, file, allocator, "output.weight") catch |err| blk: {
             if (err == error.TensorNotFound) {
                 std.debug.print("  Note: Using tied embeddings\n", .{});
                 use_tied = true;
@@ -155,13 +150,15 @@ pub const LlamaModel = struct {
                     .block_size = 32,
                     .quant_type = .Q8_0,
                     .allocator = allocator,
+                    .owns_data = false,
                 };
             }
             return err;
         };
 
-        const norm = try loadFTByName(gguf_file, file_data, allocator, "output_norm.weight");
+        const norm = try loadFTByName(gguf_file, file, allocator, "output_norm.weight");
 
+        // Memory stats
         var qb: usize = 0;
         var fb: usize = 0;
         for (layers) |*l| {
@@ -188,7 +185,6 @@ pub const LlamaModel = struct {
             .output = output,
             .use_tied_embeddings = use_tied,
             .allocator = allocator,
-            .file_data = file_data,
         };
     }
 
@@ -198,20 +194,19 @@ pub const LlamaModel = struct {
         self.norm.deinit();
         self.tok_embeddings.deinit();
         if (!self.use_tied_embeddings) self.output.deinit();
-        self.allocator.free(self.file_data);
     }
 };
 
 // =============================================================================
-// Tensor Loading
+// Tensor Loading — direct file read to aligned buffer (no double copy)
 // =============================================================================
 
-fn loadQT(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) !QuantizedTensor {
+fn loadQT(gf: *gguf.GGUFFile, file: std.fs.File, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) !QuantizedTensor {
     const name = std.fmt.bufPrint(nb, fmt, .{li}) catch unreachable;
-    return loadQTByName(gf, fd, a, name);
+    return loadQTByName(gf, file, a, name);
 }
 
-fn loadQTByName(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, name: []const u8) !QuantizedTensor {
+fn loadQTByName(gf: *gguf.GGUFFile, file: std.fs.File, a: std.mem.Allocator, name: []const u8) !QuantizedTensor {
     const ti = gf.getTensorByName(name) orelse return error.TensorNotFound;
     const off = gf.tensor_data_offset + ti.offset;
     const qt: QuantizedTensor.QuantType = switch (ti.dtype) {
@@ -230,30 +225,53 @@ fn loadQTByName(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, name: 
     for (0..ti.n_dims) |j| total *= ti.dims[j];
     const nb2 = @as(u32, @intCast(total / 32));
     const ds = @as(usize, nb2) * bpb;
+
+    const shape = try a.alloc(u32, ti.n_dims);
+    errdefer a.free(shape);
+    for (0..ti.n_dims) |j| shape[j] = @intCast(ti.dims[j]);
+
+    // Allocate aligned buffer and read directly from file
     const d = try a.alignedAlloc(u8, ALIGNMENT, ds);
     errdefer a.free(d);
-    @memcpy(d, fd[off..][0..ds]);
-    const shape = try a.alloc(u32, ti.n_dims);
-    for (0..ti.n_dims) |j| shape[j] = @intCast(ti.dims[j]);
-    return .{ .data = d, .shape = shape, .n_blocks = nb2, .block_size = 32, .quant_type = qt, .allocator = a };
+
+    try file.seekTo(off);
+    const bytes_read = try file.readAll(d);
+    if (bytes_read != ds) return error.IncompleteRead;
+
+    return .{
+        .data = d,
+        .shape = shape,
+        .n_blocks = nb2,
+        .block_size = 32,
+        .quant_type = qt,
+        .allocator = a,
+        .owns_data = true,
+    };
 }
 
-fn loadFT(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) ?Tensor {
+fn loadFT(gf: *gguf.GGUFFile, file: std.fs.File, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) ?Tensor {
     const name = std.fmt.bufPrint(nb, fmt, .{li}) catch unreachable;
-    return loadFTByName(gf, fd, a, name) catch null;
+    return loadFTByName(gf, file, a, name) catch null;
 }
 
-fn loadFTReq(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) !Tensor {
+fn loadFTReq(gf: *gguf.GGUFFile, file: std.fs.File, a: std.mem.Allocator, nb: *[128]u8, comptime fmt: []const u8, li: usize) !Tensor {
     const name = std.fmt.bufPrint(nb, fmt, .{li}) catch unreachable;
-    return loadFTByName(gf, fd, a, name);
+    return loadFTByName(gf, file, a, name);
 }
 
-fn loadFTByName(gf: *gguf.GGUFFile, fd: []const u8, a: std.mem.Allocator, name: []const u8) !Tensor {
+fn loadFTByName(gf: *gguf.GGUFFile, file: std.fs.File, a: std.mem.Allocator, name: []const u8) !Tensor {
     const ti = gf.getTensorByName(name) orelse return error.TensorNotFound;
     const off = gf.tensor_data_offset + ti.offset;
     var total: usize = 1;
     for (0..ti.n_dims) |j| total *= @intCast(ti.dims[j]);
+
+    // Allocate aligned buffer and read directly
     const data = try a.alignedAlloc(f32, ALIGNMENT, total);
-    @memcpy(std.mem.sliceAsBytes(data), fd[off..][0 .. total * 4]);
+    errdefer a.free(data);
+
+    try file.seekTo(off);
+    const bytes_read = try file.readAll(std.mem.sliceAsBytes(data));
+    if (bytes_read != total * 4) return error.IncompleteRead;
+
     return .{ .data = data, .shape = &[_]u32{@intCast(total)}, .allocator = a };
 }

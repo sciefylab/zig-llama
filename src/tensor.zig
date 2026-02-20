@@ -1,4 +1,4 @@
-// src/tensor.zig
+// src/tensor.zig — Optimized tensor ops with comptime dispatch
 const std = @import("std");
 const builtin = @import("builtin");
 const lut = @import("lut_mul.zig");
@@ -84,6 +84,7 @@ pub fn printIsaInfo() void {
         std.debug.print("CPU: avx={} avx2={} fma={}\n", .{ g_has_avx, g_has_avx2, g_has_fma });
         std.debug.print("FMA chosen: {}\n", .{g_use_fma});
     }
+    std.debug.print("Native dot: {s}\n", .{if (lut.USE_NATIVE_DOT) "YES (comptime)" else "NO (shift-add)"});
     std.debug.print("===========================\n", .{});
     if (USE_LUT_MUL) lut.printLutInfo();
 }
@@ -245,8 +246,8 @@ fn chooseQinSmallCols() bool {
         while (b < blocks) : (b += 1) {
             const sw = readF16(p);
             const sx = scales[b];
-            const dot: i32 = dotI8x32_raw(p + 2, qbuf[0..].ptr + b * QBLOCK);
-            accq += (sw * sx) * @as(f32, @floatFromInt(dot));
+            const dot_val: i32 = dotI8x32_raw(p + 2, qbuf[0..].ptr + b * QBLOCK);
+            accq += (sw * sx) * @as(f32, @floatFromInt(dot_val));
             p += QBYTES;
         }
     }
@@ -285,6 +286,7 @@ pub const QuantizedTensor = struct {
     block_size: u32,
     quant_type: QuantType,
     allocator: std.mem.Allocator,
+    owns_data: bool = true,
     pub const QuantType = enum { Q4_0, Q4_1, Q8_0 };
     pub fn deinit(self: *QuantizedTensor) void {
         if (self.data.len > 0) self.allocator.free(self.data);
@@ -328,6 +330,7 @@ inline fn loadI8x32(ptr: [*]const i8) VI8x32 {
     return @as(*align(1) const VI8x32, @ptrCast(ptr)).*;
 }
 
+// Raw native dot — always uses hardware multiply
 inline fn dotI8x32_raw(w_ptr: [*]const u8, x_ptr: [*]const i8) i32 {
     const w8: VI8x32 = loadI8x32_from_u8(w_ptr);
     const x8: VI8x32 = loadI8x32(x_ptr);
@@ -338,16 +341,16 @@ inline fn dotI8x32_raw(w_ptr: [*]const u8, x_ptr: [*]const i8) i32 {
     return @reduce(.Add, prod32);
 }
 
+// Dispatches through lut_mul for ternary support
 inline fn dotI8x32(w_ptr: [*]const u8, x_ptr: [*]const i8) i32 {
-    if (USE_LUT_MUL and lut.g_lut_enabled) return lut.dotI8x32_lut(w_ptr, x_ptr);
+    if (USE_LUT_MUL and lut.g_lut_enabled) return lut.dotI8x32_best(w_ptr, x_ptr);
     return dotI8x32_raw(w_ptr, x_ptr);
 }
 
+// Pre-loaded x vector version — NO buffer copy, direct native multiply
 inline fn dotI8x32_prex(w_ptr: [*]const u8, x8: VI8x32) i32 {
     if (USE_LUT_MUL and lut.g_lut_enabled) {
-        var x_buf: [32]i8 align(32) = undefined;
-        @as(*align(32) VI8x32, @ptrCast(&x_buf)).* = x8;
-        return lut.dotI8x32_lut(w_ptr, &x_buf);
+        return lut.dotI8x32_best_prex(w_ptr, x8);
     }
     const w8: VI8x32 = loadI8x32_from_u8(w_ptr);
     const w16: VI16x32 = @intCast(w8);
@@ -415,10 +418,10 @@ fn quantizeInputQ8_0(q_out: []i8, s_out: []f32, input: []const f32, cols: usize)
             @memset(q_out[base .. base + QBLOCK], 0);
             continue;
         }
-        const inv = 127.0 / max_abs;
+        const inv_val = 127.0 / max_abs;
         s_out[b] = max_abs / 127.0;
         for (0..QBLOCK) |ii| {
-            var qi: i32 = @intFromFloat(@round(input[base + ii] * inv));
+            var qi: i32 = @intFromFloat(@round(input[base + ii] * inv_val));
             if (qi > 127) qi = 127;
             if (qi < -127) qi = -127;
             q_out[base + ii] = @intCast(qi);
@@ -589,7 +592,6 @@ const MatVecPool = struct {
 
             pool.mutex.unlock();
 
-            // Idle workers still must signal done
             if (tid >= active) {
                 _ = pool.done.fetchAdd(1, .acq_rel);
                 pool.mutex.lock();
@@ -742,7 +744,6 @@ const MatVecPool = struct {
         const end0 = @min(rows, chunk);
         if (0 < end0) pool.doMainChunkSingle(out, data, input, end0, cols);
 
-        // Wait for ALL worker threads (not just active)
         const target: u32 = @intCast(pool.total_threads - 1);
         pool.mutex.lock();
         while (pool.done.load(.acquire) != target) pool.done_cv.wait(&pool.mutex);
